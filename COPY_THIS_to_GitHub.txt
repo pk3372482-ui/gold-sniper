@@ -1,0 +1,205 @@
+# GOLD SNIPER V3 — sab kuch isi ek file mein hai
+# GitHub par file ka naam:  .github/workflows/gold_sniper.yml
+name: Gold Sniper Alerts
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bot chalayein
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+          ACCOUNT_BALANCE: ${{ vars.ACCOUNT_BALANCE }}
+          RISK_PERCENT: ${{ vars.RISK_PERCENT }}
+          RR: ${{ vars.RR }}
+        run: |
+          cat > /tmp/bot.py <<'ENDOFPY'
+          import json, math, os, time, urllib.request, urllib.parse
+          from datetime import datetime, timezone
+
+          TG = os.environ.get('TG_TOKEN', '')
+          CH = os.environ.get('TG_CHAT', '')
+          BAL = float(os.environ.get('ACCOUNT_BALANCE') or 1000)
+          RP = float(os.environ.get('RISK_PERCENT') or 0.5)
+          RR = float(os.environ.get('RR') or 2)
+
+
+          def get(url):
+              r = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+              return json.loads(urllib.request.urlopen(r, timeout=25).read())
+
+
+          def send(txt):
+              print(txt)
+              if not (TG and CH) or os.environ.get('DRY_RUN') == '1':
+                  return
+              data = urllib.parse.urlencode({'chat_id': CH, 'text': txt,
+                                             'parse_mode': 'HTML',
+                                             'disable_web_page_preview': 'true'}).encode()
+              try:
+                  urllib.request.urlopen(f'https://api.telegram.org/bot{TG}/sendMessage',
+                                         data=data, timeout=20)
+              except Exception as e:
+                  print('telegram error:', e)
+
+
+          def ema(v, n):
+              r = [None] * len(v)
+              if len(v) < n:
+                  return r
+              k, p = 2 / (n + 1), sum(v[:n]) / n
+              r[n - 1] = p
+              for i in range(n, len(v)):
+                  p = v[i] * k + p * (1 - k)
+                  r[i] = p
+              return r
+
+
+          def rma(v, n):
+              r = [None] * len(v)
+              if len(v) < n:
+                  return r
+              p = sum(v[:n]) / n
+              r[n - 1] = p
+              for i in range(n, len(v)):
+                  p = (p * (n - 1) + v[i]) / n
+                  r[i] = p
+              return r
+
+
+          # ── data ───────────────────────────────────────────────────────────────
+          d = get('https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=60m&range=6mo')
+          res = d['chart']['result'][0]
+          q = res['indicators']['quote'][0]
+          B = []
+          for i, t in enumerate(res['timestamp']):
+              o, h, l, c = q['open'][i], q['high'][i], q['low'][i], q['close'][i]
+              if None not in (o, h, l, c):
+                  B.append({'t': t, 'o': o, 'h': h, 'l': l, 'c': c})
+          while B and B[-1]['t'] + 3600 > time.time():
+              B.pop()
+
+          C = [b['c'] for b in B]
+          f9, f200 = ema(C, 9), ema(C, 200)
+          tr = [B[0]['h'] - B[0]['l']] + [max(B[i]['h'] - B[i]['l'], abs(B[i]['h'] - B[i - 1]['c']),
+                                               abs(B[i]['l'] - B[i - 1]['c'])) for i in range(1, len(B))]
+          A = rma(tr, 14)
+          gl = [0.0] + [max(C[i] - C[i - 1], 0) for i in range(1, len(C))]
+          ls = [0.0] + [max(C[i - 1] - C[i], 0) for i in range(1, len(C))]
+          u, dn = rma(gl, 14), rma(ls, 14)
+          RSI = [None if (u[i] is None or dn[i] is None) else (100.0 if dn[i] == 0 else 100 - 100 / (1 + u[i] / dn[i]))
+                 for i in range(len(C))]
+
+          i = len(B) - 1
+          bar, f, s, a, r = B[i], f9[i], f200[i], A[i], RSI[i]
+          if None in (f, s, a, r) or a <= 0:
+              raise SystemExit('not enough data')
+
+          lo = min(x['l'] for x in B[i - 7:i + 1])
+          hi = max(x['h'] for x in B[i - 7:i + 1])
+
+          side = 0
+          if bar['c'] > s and f > s and lo <= f * 1.001 and bar['c'] > f and bar['c'] > bar['o'] and r > 50:
+              side = 1
+          elif bar['c'] < s and f < s and hi >= f * 0.999 and bar['c'] < f and bar['c'] < bar['o'] and r < 50:
+              side = -1
+
+          risk = a * 2.5
+          sl = bar['c'] - side * risk
+          tp = bar['c'] + side * risk * RR
+
+          # ── state ──────────────────────────────────────────────────────────────
+          st = {'last': None, 'trade': None}
+          if os.path.exists('state.json'):
+              try:
+                  st = json.load(open('state.json'))
+              except Exception:
+                  pass
+          changed = False
+
+
+          def save():
+              json.dump(st, open('state.json', 'w'), indent=1)
+
+
+          # exit check
+          t = st.get('trade')
+          if t:
+              for b in [x for x in B if x['t'] > t['bar']]:
+                  hit = None
+                  if t['side'] == 1:
+                      hit = ('SL', t['sl']) if b['l'] <= t['sl'] else (('TP', t['tp']) if b['h'] >= t['tp'] else None)
+                  else:
+                      hit = ('SL', t['sl']) if b['h'] >= t['sl'] else (('TP', t['tp']) if b['l'] <= t['tp'] else None)
+                  if not hit and (b['t'] - t['bar']) / 3600 >= 40:
+                      hit = ('TIME', b['c'])
+                  if hit:
+                      rr = (hit[1] - t['entry']) * t['side'] / t['risk']
+                      send(f"{'✅' if rr > 0 else '❌'} <b>EXIT {hit[0]}</b>\nGC=F 1H "
+                           f"{'LONG' if t['side'] == 1 else 'SHORT'} @ <code>{hit[1]:,.2f}</code>\n"
+                           f"Result: <b>{rr:+.2f}R</b>")
+                      st['trade'], changed = None, True
+                      break
+
+          # new signal
+          if side and not st.get('trade') and st.get('last') != bar['t']:
+              tgt = BAL * RP / 100
+              per = risk * 100
+              lots = max(0.01, math.floor((tgt / per) / 0.01) * 0.01)
+              lots = round(min(lots, 5.0), 2)
+              act = lots * per
+              msg = [f"{'🟢 <b>BUY SIGNAL</b> 🟢' if side == 1 else '🔴 <b>SELL SIGNAL</b> 🔴'}", '',
+                     "<b>GC=F</b> · 1H · Gold Sniper V3", '─' * 24,
+                     f"{'▲' if side == 1 else '▼'} <b>Entry</b>  <code>{bar['c']:,.2f}</code>",
+                     f"🛑 <b>SL</b>     <code>{sl:,.2f}</code>",
+                     f"🎯 <b>TP</b>     <code>{tp:,.2f}</code>",
+                     f"⚖️ <b>RR</b>     1:{RR:g}",
+                     f"📏 <b>Risk</b>   {risk:,.2f} (2.5×ATR)",
+                     f"📦 <b>SIZE</b>   <b>{lots:.2f} lot</b>  → MT5 mein yahi daalein"]
+              if tgt / per < 0.01:
+                  msg.append(f"⚠️ <b>WARNING:</b> min lot {lots:.2f} par risk <b>{act / BAL * 100:.1f}%</b> "
+                             f"({act:,.2f}), na ki {RP:g}% ({tgt:,.2f}).")
+                  msg.append(f"<i>Safe 0.5% ke liye balance kam se kam {act * 200:,.0f} chahiye.</i>")
+              else:
+                  msg.append(f"<i>Risk {RP:g}% of {BAL:,.0f} = {act:,.2f}</i>")
+              msg += [f"📐 <b>DIST</b>   SL {risk:,.2f} · TP {risk * RR:,.2f}",
+                      '─' * 24,
+                      f"RSI {r:.1f} · EMA9 {f:,.2f} · EMA200 {s:,.2f}",
+                      f"🕐 {datetime.fromtimestamp(bar['t'], timezone.utc):%Y-%m-%d %H:%M} UTC", '',
+                      "<i>Levels futures par. Broker par DIST use karein.</i>"]
+              send('\n'.join(msg))
+              st['last'] = bar['t']
+              st['trade'] = {'side': side, 'entry': bar['c'], 'sl': sl, 'tp': tp, 'risk': risk, 'bar': bar['t']}
+              changed = True
+              print('SIGNAL SENT')
+          else:
+              print(f"no signal (close={bar['c']:.2f} ema9={f:.2f} ema200={s:.2f} rsi={r:.1f})")
+
+          if changed:
+              save()
+          ENDOFPY
+          python3 /tmp/bot.py
+
+      - name: State save
+        run: |
+          if [ -f state.json ]; then
+            git config user.name "bot"
+            git config user.email "bot@users.noreply.github.com"
+            git add state.json
+            if ! git diff --staged --quiet; then
+              git commit -m "state"
+              git push
+            fi
+          fi
