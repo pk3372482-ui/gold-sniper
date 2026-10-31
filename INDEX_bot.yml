@@ -1,0 +1,286 @@
+# INDEX SIGNAL BOT — NIFTY 50 + SENSEX + NASDAQ, ek hi file mein
+# Github par file ka naam:  .github/workflows/index.yml
+name: Index Alerts
+
+on:
+  schedule:
+    - cron: '5,20,35,50 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bot chalayein
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+          ACCOUNT_BALANCE: ${{ vars.ACCOUNT_BALANCE }}
+          RISK_PERCENT: ${{ vars.RISK_PERCENT }}
+        run: |
+          cat > /tmp/bot.py <<'ENDOFPY'
+          import json, math, os, time, urllib.request, urllib.parse
+          from datetime import datetime, timezone
+
+          TG = os.environ.get('TG_TOKEN', '')
+          CH = os.environ.get('TG_CHAT', '')
+          BAL = float(os.environ.get('ACCOUNT_BALANCE') or 1000)
+          RP = float(os.environ.get('RISK_PERCENT') or 0.5)
+          STATE = 'state_index.json'
+          TSTOP = 40
+          TPCT = 0.001
+          CATCHUP = 48          # how many missed bars to scan if GitHub delayed us
+
+          MARKETS = [
+              dict(name='NIFTY 50', sym='^NSEI', ef=9, es=50, sl=3.0, lb=3, adx=18, rr=1.5,
+                   units=[('1 lot', 25, '₹')],
+                   note='NIFTY lot = 25 qty (broker se confirm karein).',
+                   verified='PF 1.26 · 167 trades · 49.7% WR'),
+              dict(name='SENSEX', sym='^BSESN', ef=9, es=200, sl=2.5, lb=3, adx=18, rr=2.0,
+                   units=[('1 lot', 20, '₹')],
+                   note='SENSEX lot = 20 qty (broker se confirm karein).',
+                   verified='PF 1.28 · 177 trades · 44.6% WR'),
+              dict(name='NASDAQ 100', sym='NQ=F', ef=9, es=50, sl=2.5, lb=3, adx=0, rr=2.0,
+                   units=[('MNQ', 2, '$'), ('NQ', 20, '$')],
+                   note='MNQ min size mehnga hai. Broker NAS100 CFD (fractional lot) deta hai to wahi lein.',
+                   verified='PF 1.18 · 497 trades · 43.5% WR'),
+          ]
+
+
+          def get(url):
+              r = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+              return json.loads(urllib.request.urlopen(r, timeout=25).read())
+
+
+          def send(txt):
+              print(txt)
+              print()
+              if not (TG and CH) or os.environ.get('DRY_RUN') == '1':
+                  return
+              data = urllib.parse.urlencode({'chat_id': CH, 'text': txt, 'parse_mode': 'HTML',
+                                             'disable_web_page_preview': 'true'}).encode()
+              try:
+                  urllib.request.urlopen('https://api.telegram.org/bot' + TG + '/sendMessage',
+                                         data=data, timeout=20)
+              except Exception as e:
+                  print('telegram error:', e)
+
+
+          def ema(v, n):
+              r = [None] * len(v)
+              if len(v) < n:
+                  return r
+              k, p = 2 / (n + 1), sum(v[:n]) / n
+              r[n - 1] = p
+              for i in range(n, len(v)):
+                  p = v[i] * k + p * (1 - k)
+                  r[i] = p
+              return r
+
+
+          def rma(v, n):
+              r = [None] * len(v)
+              if len(v) < n:
+                  return r
+              p = sum(v[:n]) / n
+              r[n - 1] = p
+              for i in range(n, len(v)):
+                  p = (p * (n - 1) + v[i]) / n
+                  r[i] = p
+              return r
+
+
+          def bars_for(sym):
+              d = get('https://query1.finance.yahoo.com/v8/finance/chart/' + sym
+                      + '?interval=60m&range=6mo')
+              res = d['chart']['result'][0]
+              q = res['indicators']['quote'][0]
+              B = []
+              for i, t in enumerate(res['timestamp']):
+                  o, h, l, c = q['open'][i], q['high'][i], q['low'][i], q['close'][i]
+                  if None not in (o, h, l, c) and c > 0:
+                      B.append({'t': t, 'o': o, 'h': h, 'l': l, 'c': c})
+              while B and B[-1]['t'] + 3600 > time.time():
+                  B.pop()
+              return B
+
+
+          def indicators(B, ef, es):
+              C = [b['c'] for b in B]; H = [b['h'] for b in B]; L = [b['l'] for b in B]
+              fE, sE, tE = ema(C, ef), ema(C, es), ema(C, 200)
+              tr = [H[0] - L[0]] + [max(H[i] - L[i], abs(H[i] - C[i - 1]), abs(L[i] - C[i - 1]))
+                                    for i in range(1, len(C))]
+              A = rma(tr, 14)
+              gl = [0.0] + [max(C[i] - C[i - 1], 0) for i in range(1, len(C))]
+              ls = [0.0] + [max(C[i - 1] - C[i], 0) for i in range(1, len(C))]
+              u, dn = rma(gl, 14), rma(ls, 14)
+              RSI = [None if (u[i] is None or dn[i] is None) else (100.0 if dn[i] == 0 else 100 - 100 / (1 + u[i] / dn[i]))
+                     for i in range(len(C))]
+              up = [0.0] + [H[i] - H[i - 1] for i in range(1, len(C))]
+              dw = [0.0] + [L[i - 1] - L[i] for i in range(1, len(C))]
+              plus = [up[i] if (up[i] > dw[i] and up[i] > 0) else 0.0 for i in range(len(C))]
+              minus = [dw[i] if (dw[i] > up[i] and dw[i] > 0) else 0.0 for i in range(len(C))]
+              rp_, rm_ = rma(plus, 14), rma(minus, 14)
+              PDI = [None if (rp_[i] is None or not A[i]) else 100 * rp_[i] / A[i] for i in range(len(C))]
+              MDI = [None if (rm_[i] is None or not A[i]) else 100 * rm_[i] / A[i] for i in range(len(C))]
+              DX = [0.0 if (PDI[i] is None or (PDI[i] + MDI[i]) == 0)
+                    else 100 * abs(PDI[i] - MDI[i]) / (PDI[i] + MDI[i]) for i in range(len(C))]
+              return C, fE, sE, tE, A, RSI, rma(DX, 14)
+
+
+          st = {}
+          if os.path.exists(STATE):
+              try:
+                  st = json.load(open(STATE))
+              except Exception:
+                  st = {}
+          changed = False
+          now = time.time()
+
+          for M in MARKETS:
+              name = M['name']
+              try:
+                  B = bars_for(M['sym'])
+              except Exception as e:
+                  print(name, 'data error:', e)
+                  continue
+              if len(B) < 260:
+                  print(name, 'not enough bars:', len(B))
+                  continue
+
+              C, fE, sE, tE, A, RSI, ADX = indicators(B, M['ef'], M['es'])
+              ms = st.setdefault(name, {'last': None, 'trade': None})
+
+              start = 0
+              if ms.get('last') is None:
+                  start = len(B) - 1          # first ever run: only the newest bar
+              else:
+                  while start < len(B) and B[start]['t'] <= ms['last']:
+                      start += 1
+                  if len(B) - start > CATCHUP:
+                      start = len(B) - CATCHUP
+              if start >= len(B):
+                  print('{}: nothing new (last={})'.format(
+                      name, datetime.fromtimestamp(ms['last'], timezone.utc).strftime('%Y-%m-%d %H:%M')))
+                  continue
+
+              caught = len(B) - start
+              print('{}: scanning {} bar(s)'.format(name, caught))
+              fired = 0
+
+              for i in range(start, len(B)):
+                  bar = B[i]
+                  fe, se, te, a, r, ad = fE[i], sE[i], tE[i], A[i], RSI[i], ADX[i]
+                  if None in (fe, se, te, a, r, ad) or a <= 0:
+                      continue
+
+                  # 1) does an open trade exit on this bar?
+                  t = ms.get('trade')
+                  if t and bar['t'] > t['bar']:
+                      hit = None
+                      if t['side'] == 1:
+                          hit = ('SL', t['sl']) if bar['l'] <= t['sl'] else (('TP', t['tp']) if bar['h'] >= t['tp'] else None)
+                      else:
+                          hit = ('SL', t['sl']) if bar['h'] >= t['sl'] else (('TP', t['tp']) if bar['l'] <= t['tp'] else None)
+                      if not hit and (bar['t'] - t['bar']) / 3600 >= TSTOP:
+                          hit = ('TIME', bar['c'])
+                      if hit:
+                          rr_ = (hit[1] - t['entry']) * t['side'] / t['risk']
+                          send(('✅' if rr_ > 0 else '❌') + ' <b>EXIT ' + hit[0] + '</b>\n<b>' + name
+                               + '</b> 1H ' + ('LONG' if t['side'] == 1 else 'SHORT')
+                               + ' @ <code>{:,.2f}</code>\nResult: <b>{:+.2f}R</b>'.format(hit[1], rr_))
+                          ms['trade'] = None
+                          changed = True
+
+                  if ms.get('trade'):
+                      continue
+
+                  # 2) new signal on this bar?
+                  lo = min(B[k]['l'] for k in range(i - (M['lb'] - 1), i + 1))
+                  hi = max(B[k]['h'] for k in range(i - (M['lb'] - 1), i + 1))
+                  atr_pct = a / bar['c'] * 100
+                  side = 0
+                  if (bar['c'] > te and fe > se and lo <= fe * (1 + TPCT) and bar['c'] > fe
+                          and bar['c'] > bar['o'] and r > 50 and ad > M['adx'] and atr_pct > 0.01):
+                      side = 1
+                  elif (bar['c'] < te and fe < se and hi >= fe * (1 - TPCT) and bar['c'] < fe
+                          and bar['c'] < bar['o'] and r < 50 and ad > M['adx'] and atr_pct > 0.01):
+                      side = -1
+                  if not side:
+                      continue
+
+                  risk = a * M['sl']
+                  sl = bar['c'] - side * risk
+                  tp = bar['c'] + side * risk * M['rr']
+                  age_h = (now - bar['t']) / 3600
+
+                  head = '🟢 <b>BUY SIGNAL</b> 🟢' if side == 1 else '🔴 <b>SELL SIGNAL</b> 🔴'
+                  m = [head, '', '<b>' + name + '</b> · 1H · Gold Sniper Engine', '─' * 24]
+                  if age_h > 2:
+                      m.append('⚠️ <b>YE SIGNAL ' + '{:.0f}'.format(age_h) + ' GHANTE PURANA HAI</b> — '
+                               'price ab bahut alag ho sakta hai. Entry lene se pehle chart dekhein.')
+                      m.append('')
+                  m += [('▲' if side == 1 else '▼') + ' <b>Entry</b>  <code>{:,.2f}</code>'.format(bar['c']),
+                        '🛑 <b>SL</b>     <code>{:,.2f}</code>'.format(sl),
+                        '🎯 <b>TP</b>     <code>{:,.2f}</code>'.format(tp),
+                        '⚖️ <b>RR</b>     1:{:g}'.format(M['rr']),
+                        '📏 <b>Risk</b>   {:,.2f} pts ({:g}×ATR)'.format(risk, M['sl']),
+                        '📐 <b>DIST</b>   SL {:,.2f} · TP {:,.2f}'.format(risk, risk * M['rr']),
+                        '─' * 24]
+                  parts = [lab + ' ' + cur + '{:,.0f}'.format(risk * pv) for lab, pv, cur in M['units']]
+                  m.append('💰 ' + ' · '.join(parts))
+                  tgt = BAL * RP / 100
+                  usd = [(l, v) for l, v, cu in M['units'] if cu == '$']
+                  if usd:
+                      lab, pv = usd[0]
+                      val = risk * pv
+                      if val > tgt:
+                          m.append('⚠️ <b>NOTE:</b> min size ({}) par risk <b>${:,.0f}</b> = <b>{:.1f}%</b> of {:,.0f}.'
+                                   .format(lab, val, val / BAL * 100, BAL))
+                      else:
+                          m.append('🎯 Target risk ${:,.0f} → <b>{:.2f} unit</b>'
+                                   .format(tgt, math.floor(tgt / val * 100) / 100))
+                  else:
+                      m.append('<i>₹ risk upar — apne account size se compare karein.</i>')
+                  m += ['─' * 24,
+                        'RSI {:.1f} · EMA{} {:,.2f} · EMA{} {:,.2f} · ADX {:.1f}'.format(r, M['ef'], fe, M['es'], se, ad),
+                        '🕐 {} UTC'.format(datetime.fromtimestamp(bar['t'], timezone.utc).strftime('%Y-%m-%d %H:%M')),
+                        '',
+                        '<i>Levels index par. Broker par DIST use karein.</i>',
+                        '<i>' + M['note'] + '</i>',
+                        '<i>Verified: ' + M['verified'] + '</i>']
+                  send('\n'.join(m))
+                  ms['trade'] = {'side': side, 'entry': bar['c'], 'sl': sl, 'tp': tp, 'risk': risk, 'bar': bar['t']}
+                  changed = True
+                  fired += 1
+                  print(name, 'SIGNAL SENT')
+
+              ms['last'] = B[-1]['t']
+              changed = True
+              if not fired:
+                  print('{}: no new signal'.format(name))
+
+          if changed:
+              json.dump(st, open(STATE, 'w'), indent=1)
+              print('state saved')
+          ENDOFPY
+          python3 /tmp/bot.py
+
+      - name: State save
+        run: |
+          if [ -f state_index.json ]; then
+            git config user.name "bot"
+            git config user.email "bot@users.noreply.github.com"
+            git add state_index.json
+            if ! git diff --staged --quiet; then
+              git commit -m "state index"
+              git pull --rebase --autostash || true
+              git push || true
+            fi
+          fi
