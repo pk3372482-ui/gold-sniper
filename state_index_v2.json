@@ -1,0 +1,17 @@
+{
+ "NIFTY 50": {
+  "last": 1793699100,
+  "trade": null,
+  "tf": "15m"
+ },
+ "SENSEX": {
+  "last": 1793699100,
+  "trade": null,
+  "tf": "15m"
+ },
+ "NASDAQ 100": {
+  "last": 1793710800,
+  "trade": null,
+  "tf": "60m"
+ }
+}
