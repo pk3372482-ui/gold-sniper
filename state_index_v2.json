@@ -12,12 +12,12 @@
   "tf": "15m"
  },
  "SENSEX": {
-  "last": 1793767530,
+  "last": 1793767627,
   "trade": null,
   "tf": "15m"
  },
  "NASDAQ 100": {
-  "last": 1793761200,
+  "last": 1793764800,
   "trade": {
    "side": -1,
    "entry": 27711.5,
