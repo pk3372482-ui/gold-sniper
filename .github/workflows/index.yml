@@ -159,15 +159,15 @@ jobs:
               dict(name='NIFTY 50', sym='^NSEI', interval='15m', rng='60d', bar_min=15,
                    ef=9, es=50, sl=3.0, lb=3, adx=0, rr=2.0, tstop=25, catchup=200,
                    sess=(9 * 60 + 15, 15 * 60 + 30), gate=14 * 60 + 30, maxdelay=45,
-                   units=[('Fut 1 lot', 65, 'INR')], opt=(65, 50),
-                   note='NIFTY lot = 65 qty. Option: auto expiry (ATM, Tuesday).',
+                   units=[('Fut 1 lot', 65, 'INR')], opt=(65, 50, 3),
+                   note='NIFTY lot = 65 qty. Option: OTM3, auto expiry (Tuesday).',
                    verified='PF 1.50 | 57 trades | 49.1% WR | 60 din | 3/4 fold pass'),
 
               dict(name='SENSEX', sym='^BSESN', interval='15m', rng='60d', bar_min=15,
                    ef=9, es=200, sl=3.0, lb=3, adx=0, rr=2.0, tstop=25, catchup=200,
                    sess=(9 * 60 + 15, 15 * 60 + 30), gate=14 * 60 + 30, maxdelay=45,
-                   units=[('Fut 1 lot', 20, 'INR')], opt=(20, 100),
-                   note='SENSEX lot = 20 qty. Option: auto expiry (ATM, Thursday).',
+                   units=[('Fut 1 lot', 20, 'INR')], opt=(20, 100, 3),
+                   note='SENSEX lot = 20 qty. Option: OTM3, auto expiry (Thursday).',
                    verified='PF 1.40 | 57 trades | 49.1% WR | 60 din | 4/4 fold pass'),
 
               dict(name='NASDAQ 100', sym='NQ=F', interval='60m', rng='6mo', bar_min=60,
@@ -491,8 +491,9 @@ jobs:
                                .format(tgt, risk * M['units'][0][1]))
                   K, p0 = 0, 0.0
                   if M.get('opt'):
-                      oq, ost = M['opt']
-                      K = int(round(bar['c'] / ost) * ost)
+                      oq, ost, ootm = M['opt']
+                      K = int(round(bar['c'] / ost) * ost + ootm * ost * side)   # + = OTM
+                      mlab = 'ATM' if ootm == 0 else 'OTM{}'.format(ootm)
                       call = side == 1
                       exp_d, dte, exp_note = expiry_for(name, datetime.fromtimestamp(now, IST), B)
                       p0 = opt_leg(bar['c'], K, dte, call)
@@ -500,8 +501,8 @@ jobs:
                       pt = opt_leg(tp, K, dte, call)
                       m += ['─' * 24,
                             '📈 <b>OPTION MODE</b> · ' + ('BUY CALL (CE)' if call else 'BUY PUT (PE)'),
-                            '🎫 Strike <code>{:,} {}</code>   (ATM · {} · {} din)'.format(
-                                K, 'CE' if call else 'PE',
+                            '🎫 Strike <code>{:,} {}</code>   ({} · {} · {} din)'.format(
+                                K, 'CE' if call else 'PE', mlab,
                                 exp_d.strftime('%d-%b') if exp_d else '?', dte),
                             '💵 Premium ~<code>₹{:,.0f}</code>   → 1 lot = <b>₹{:,.0f}</b>'.format(p0, p0 * oq),
                             '🛑 SL par option ~₹{:,.0f}   ({:+.0f}%)'.format(ps, (ps - p0) / p0 * 100),
