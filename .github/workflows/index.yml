@@ -47,9 +47,83 @@ jobs:
           # 60-din test: NIFTY PF 1.59 / SENSEX PF 1.54 (spread + IV crush ke baad bhi)
           # 7-din aur 30-din NAHI: IV crush se PF 0.74 / 0.55 par gir jaata hai.
           # ---------------------------------------------------------------------------
-          OPT_DAYS = 3
+          # ---------------------------------------------------------------------------
+          # AUTO EXPIRY
+          # NIFTY weekly = Tuesday, SENSEX weekly = Thursday (SEBI rule, Sep 2025 se).
+          # Holiday ho to expiry pichle TRADING din par. 0-1 din bache ho to agla hafta.
+          # Holiday source 3 layer: 2026 official + 2027 estimate + bars se auto-detect.
+          # ---------------------------------------------------------------------------
+          EXPIRY_WD = {'NIFTY 50': 1, 'SENSEX': 3}
+          SUPPORTED_YEARS = {2026, 2027}
+
+          HOLIDAYS = {
+              # ---- 2026 : NSE official (equity + F&O) -------------------------------
+              '2026-01-26', '2026-03-03', '2026-03-26', '2026-03-31', '2026-04-03',
+              '2026-04-14', '2026-05-01', '2026-05-28', '2026-06-26', '2026-09-14',
+              '2026-10-02', '2026-10-20', '2026-11-10', '2026-11-24', '2026-12-25',
+              # ---- 2027 : NSE ne official publish NAHI kiya -- ye ESTIMATE hain -----
+              '2027-01-26', '2027-03-10', '2027-03-22', '2027-03-26', '2027-04-14',
+              '2027-04-15', '2027-04-19', '2027-05-17', '2027-06-15', '2027-10-29',
+          }
           IV_OPT = 0.11
           RATE = 0.065
+
+
+          def _closed_days(B):
+              """Pichle 60 din ke bars se khud pata karo kaunse working days band the."""
+              if not B or len(B) < 200:
+                  return set()
+              days = sorted({datetime.fromtimestamp(b['t'], IST).date() for b in B})
+              if len(days) < 25:
+                  return set()
+              have = set(days)
+              out = set()
+              d = days[0] + timedelta(days=1)          # pehla din adhura ho sakta hai
+              last = days[-1] - timedelta(days=1)      # aaj ka din adhura hai
+              while d <= last:
+                  if d.weekday() < 5 and d not in have:
+                      out.add(d.isoformat())
+                  d += timedelta(days=1)
+              return out
+
+
+          def _prev_trading_day(d, extra):
+              while d.weekday() >= 5 or d.isoformat() in HOLIDAYS or d.isoformat() in extra:
+                  d -= timedelta(days=1)
+              return d
+
+
+          def _expiry_candidates(today, wd, extra, span=25):
+              out = []
+              for k in range(span):
+                  cand = today + timedelta(days=k)
+                  if cand.weekday() != wd:
+                      continue
+                  out.append(_prev_trading_day(cand, extra))
+              return sorted(set(out))
+
+
+          def expiry_for(name, now_dt, B=None):
+              """(expiry date, din bache, note). 0-1 din wala contract nahi lete."""
+              wd = EXPIRY_WD.get(name)
+              if wd is None:
+                  return None, 3, ''
+              extra = _closed_days(B) if B else set()
+              today = now_dt.date()
+              c = [d for d in _expiry_candidates(today, wd, extra) if d >= today]
+              notes = []
+              if now_dt.year not in SUPPORTED_YEARS:
+                  notes.append('{} ki holiday list purani hai -- expiry date broker se confirm karein'
+                               .format(now_dt.year))
+              if not c:
+                  return None, 3, ' · '.join(notes)
+              d0 = c[0]
+              dte = (d0 - today).days
+              if dte <= 1 and len(c) > 1:
+                  notes.append('{} ({} din) skip -- theta bahut tez'.format(d0.strftime('%d-%b'), dte))
+                  d0 = c[1]
+                  dte = (d0 - today).days
+              return d0, dte, ' · '.join(notes)
 
 
           def _Nd(x):
@@ -86,14 +160,14 @@ jobs:
                    ef=9, es=50, sl=3.0, lb=3, adx=0, rr=2.0, tstop=25, catchup=200,
                    sess=(9 * 60 + 15, 15 * 60 + 30), gate=14 * 60 + 30, maxdelay=45,
                    units=[('Fut 1 lot', 65, 'INR')], opt=(65, 50),
-                   note='NIFTY lot = 65 qty. Option: 3-din ATM CE/PE.',
+                   note='NIFTY lot = 65 qty. Option: auto expiry (ATM, Tuesday).',
                    verified='PF 1.50 | 57 trades | 49.1% WR | 60 din | 3/4 fold pass'),
 
               dict(name='SENSEX', sym='^BSESN', interval='15m', rng='60d', bar_min=15,
                    ef=9, es=200, sl=3.0, lb=3, adx=0, rr=2.0, tstop=25, catchup=200,
                    sess=(9 * 60 + 15, 15 * 60 + 30), gate=14 * 60 + 30, maxdelay=45,
                    units=[('Fut 1 lot', 20, 'INR')], opt=(20, 100),
-                   note='SENSEX lot = 20 qty. 1 lot ka risk NIFTY se ~3x -- dhyan rakhein.',
+                   note='SENSEX lot = 20 qty. Option: auto expiry (ATM, Thursday).',
                    verified='PF 1.40 | 57 trades | 49.1% WR | 60 din | 4/4 fold pass'),
 
               dict(name='NASDAQ 100', sym='NQ=F', interval='60m', rng='6mo', bar_min=60,
@@ -320,7 +394,7 @@ jobs:
                           rr_ = (hit[1] - t['entry']) * t['side'] / t['risk']
                           oline = ''
                           if t.get('K') and t.get('p0'):
-                              dleft = OPT_DAYS - (bar['t'] - t['bar']) / 86400.0
+                              dleft = t.get('dte', 3) - (bar['t'] - t['bar']) / 86400.0
                               px = opt_leg(hit[1], t['K'], dleft, t['side'] == 1)
                               oline = '\n🎫 {} {} ~₹{:,.0f} → <b>{:+.0f}%</b>'.format(
                                   t['K'], 'CE' if t['side'] == 1 else 'PE', px,
@@ -420,19 +494,23 @@ jobs:
                       oq, ost = M['opt']
                       K = int(round(bar['c'] / ost) * ost)
                       call = side == 1
-                      p0 = opt_leg(bar['c'], K, OPT_DAYS, call)
-                      ps = opt_leg(sl, K, OPT_DAYS, call)
-                      pt = opt_leg(tp, K, OPT_DAYS, call)
+                      exp_d, dte, exp_note = expiry_for(name, datetime.fromtimestamp(now, IST), B)
+                      p0 = opt_leg(bar['c'], K, dte, call)
+                      ps = opt_leg(sl, K, dte, call)
+                      pt = opt_leg(tp, K, dte, call)
                       m += ['─' * 24,
                             '📈 <b>OPTION MODE</b> · ' + ('BUY CALL (CE)' if call else 'BUY PUT (PE)'),
-                            '🎫 Strike <code>{:,} {}</code>   (ATM · {} din)'.format(
-                                K, 'CE' if call else 'PE', OPT_DAYS),
+                            '🎫 Strike <code>{:,} {}</code>   (ATM · {} · {} din)'.format(
+                                K, 'CE' if call else 'PE',
+                                exp_d.strftime('%d-%b') if exp_d else '?', dte),
                             '💵 Premium ~<code>₹{:,.0f}</code>   → 1 lot = <b>₹{:,.0f}</b>'.format(p0, p0 * oq),
                             '🛑 SL par option ~₹{:,.0f}   ({:+.0f}%)'.format(ps, (ps - p0) / p0 * 100),
                             '🎯 TP par option ~₹{:,.0f}   ({:+.0f}%)'.format(pt, (pt - p0) / p0 * 100),
-                            '⏱ Bot ka EXIT message aate hi nikal jao.',
-                            '<i>Premium = BS estimate (IV {:.0f}%), asli quote nahi. '
-                            'VIX high ho to signal chhod dein.</i>'.format(IV_OPT * 100)]
+                            '⏱ Bot ka EXIT message aate hi nikal jao.']
+                      if exp_note:
+                          m.append('⌛ ' + exp_note)
+                      m.append('<i>Premium = BS estimate (IV {:.0f}%), asli quote nahi. '
+                               'VIX high ho to signal chhod dein.</i>'.format(IV_OPT * 100))
                   m.append('─' * 24)
                   m.append('⏰ Bar band: <b>{}</b> IST · alert {:.0f} min baad'
                            .format(datetime.fromtimestamp(end, IST).strftime('%H:%M'), delay_min))
@@ -448,7 +526,8 @@ jobs:
                         '<i>Verified: ' + M['verified'] + '</i>']
                   send('\n'.join(m))
                   ms['trade'] = {'side': side, 'entry': bar['c'], 'sl': sl, 'tp': tp,
-                                 'risk': risk, 'bar': bar['t'], 'K': K, 'p0': p0}
+                                 'risk': risk, 'bar': bar['t'], 'K': K, 'p0': p0,
+                                 'dte': (dte if M.get('opt') else 3)}
                   changed = True
                   fired += 1
                   print(name, 'SIGNAL SENT')
