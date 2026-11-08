@@ -42,6 +42,34 @@ jobs:
           FAKE_NOW = os.environ.get('FAKE_NOW')          # epoch seconds, replay test ke liye
           OFFLINE = os.environ.get('OFFLINE_JSON')       # cached Yahoo JSON folder
 
+          # ---------------------------------------------------------------------------
+          # OPTION MODE -- 3-din expiry ATM CE/PE
+          # 60-din test: NIFTY PF 1.59 / SENSEX PF 1.54 (spread + IV crush ke baad bhi)
+          # 7-din aur 30-din NAHI: IV crush se PF 0.74 / 0.55 par gir jaata hai.
+          # ---------------------------------------------------------------------------
+          OPT_DAYS = 3
+          IV_OPT = 0.11
+          RATE = 0.065
+
+
+          def _Nd(x):
+              return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+          def bs(S, K, T, iv, call):
+              """Black-Scholes. Sirf estimate -- asli quote se +/-40% farak ho sakta hai."""
+              if T <= 0:
+                  return max(S - K, 0.0) if call else max(K - S, 0.0)
+              d1 = (math.log(S / K) + (RATE + iv * iv / 2.0) * T) / (iv * math.sqrt(T))
+              d2 = d1 - iv * math.sqrt(T)
+              if call:
+                  return S * _Nd(d1) - K * math.exp(-RATE * T) * _Nd(d2)
+              return K * math.exp(-RATE * T) * _Nd(-d2) - S * _Nd(-d1)
+
+
+          def opt_leg(spot, strike, days_left, call):
+              return bs(spot, strike, max(days_left, 0.25) / 365.0, IV_OPT, call)
+
 
           def now_ts():
               return float(FAKE_NOW) if FAKE_NOW else time.time()
@@ -56,15 +84,15 @@ jobs:
           MARKETS = [
               dict(name='NIFTY 50', sym='^NSEI', interval='15m', rng='60d', bar_min=15,
                    ef=9, es=50, sl=3.0, lb=3, adx=0, rr=2.0, tstop=25, catchup=200,
-                   sess=(9 * 60 + 15, 15 * 60 + 30), gate=14 * 60 + 30, maxdelay=25,
-                   units=[('1 lot', 25, 'INR')],
-                   note='NIFTY lot = 25 qty (broker se confirm karein).',
+                   sess=(9 * 60 + 15, 15 * 60 + 30), gate=14 * 60 + 30, maxdelay=45,
+                   units=[('Fut 1 lot', 65, 'INR')], opt=(65, 50),
+                   note='NIFTY lot = 65 qty. Option: 3-din ATM CE/PE.',
                    verified='PF 1.50 | 57 trades | 49.1% WR | 60 din | 3/4 fold pass'),
 
               dict(name='SENSEX', sym='^BSESN', interval='15m', rng='60d', bar_min=15,
                    ef=9, es=200, sl=3.0, lb=3, adx=0, rr=2.0, tstop=25, catchup=200,
-                   sess=(9 * 60 + 15, 15 * 60 + 30), gate=14 * 60 + 30, maxdelay=25,
-                   units=[('1 lot', 20, 'INR')],
+                   sess=(9 * 60 + 15, 15 * 60 + 30), gate=14 * 60 + 30, maxdelay=45,
+                   units=[('Fut 1 lot', 20, 'INR')], opt=(20, 100),
                    note='SENSEX lot = 20 qty. 1 lot ka risk NIFTY se ~3x -- dhyan rakhein.',
                    verified='PF 1.40 | 57 trades | 49.1% WR | 60 din | 4/4 fold pass'),
 
@@ -156,6 +184,22 @@ jobs:
               if not M['sess']:
                   return True
               return open_ts_of_day(now, M['sess']) <= now < close_ts_of_day(now, M['sess'])
+
+
+          def live_price(M):
+              """Abhi ka bhav. Alert late hai ya nahi -- yeh check karne ke liye."""
+              try:
+                  d = get('https://query1.finance.yahoo.com/v8/finance/chart/' + M['sym']
+                          + '?interval=1m&range=1d')
+                  res = d['chart']['result'][0]
+                  q = res['indicators']['quote'][0]
+                  for i in range(len(res['timestamp']) - 1, -1, -1):
+                      c = q['close'][i]
+                      if c and c > 0:
+                          return float(c)
+              except Exception as e:
+                  print('live price fail:', e)
+              return None
 
 
           def bars_for(M):
@@ -274,10 +318,17 @@ jobs:
                           hit = ('TIME', bar['c'])
                       if hit:
                           rr_ = (hit[1] - t['entry']) * t['side'] / t['risk']
+                          oline = ''
+                          if t.get('K') and t.get('p0'):
+                              dleft = OPT_DAYS - (bar['t'] - t['bar']) / 86400.0
+                              px = opt_leg(hit[1], t['K'], dleft, t['side'] == 1)
+                              oline = '\n🎫 {} {} ~₹{:,.0f} → <b>{:+.0f}%</b>'.format(
+                                  t['K'], 'CE' if t['side'] == 1 else 'PE', px,
+                                  (px - t['p0']) / t['p0'] * 100)
                           send(('✅' if rr_ > 0 else '❌') + ' <b>EXIT ' + hit[0] + '</b>\n<b>' + name
                                + '</b> ' + tf + ' ' + ('LONG' if t['side'] == 1 else 'SHORT')
                                + ' @ <code>{:,.2f}</code>\nEntry <code>{:,.2f}</code> → Result: <b>{:+.2f}R</b>'
-                               .format(hit[1], t['entry'], rr_))
+                               .format(hit[1], t['entry'], rr_) + oline)
                           ms['trade'] = None
                           changed = True
 
@@ -319,6 +370,18 @@ jobs:
                   tp = bar['c'] + side * risk * M['rr']
                   delay_min = (now - end) / 60
 
+                  # ---- FRESHNESS GUARD: trade nikal chuki hai to alert mat bhejo ----
+                  live = live_price(M)
+                  drift = (live - bar['c']) * side if live else None
+                  if drift is not None:
+                      if drift <= -risk * 0.5:
+                          print('{}: SKIP -- price SL ki taraf {:,.0f} pts (risk ka {:.0f}%) nikal gayi'
+                                .format(name, -drift, -drift / risk * 100))
+                          continue
+                      if drift >= risk * M['rr'] * 0.75:
+                          print('{}: SKIP -- price TP ke paas nikal gayi ({:,.0f} pts)'.format(name, drift))
+                          continue
+
                   head = '🟢 <b>BUY SIGNAL</b> 🟢' if side == 1 else '🔴 <b>SELL SIGNAL</b> 🔴'
                   m = [head, '', '<b>' + name + '</b> · ' + tf + ' · Gold Sniper Engine', '─' * 24]
                   m += [('▲' if side == 1 else '▼') + ' <b>Entry</b>  <code>{:,.2f}</code>'.format(bar['c']),
@@ -328,6 +391,11 @@ jobs:
                         '📏 <b>Risk</b>   {:,.2f} pts ({:g}×ATR)'.format(risk, M['sl']),
                         '📐 <b>DIST</b>   SL {:,.2f} · TP {:,.2f}'.format(risk, risk * M['rr']),
                         '─' * 24]
+                  if drift is not None:
+                      if drift < -risk * 0.25:
+                          m.insert(len(m) - 1, '\u26a0\ufe0f <b>LATE:</b> live {:,.2f} ({:+,.0f} pts = {:+.0f}% risk) -- entry kamzor'.format(live, drift, drift / risk * 100))
+                      else:
+                          m.insert(len(m) - 1, '\u2705 <b>Entry abhi valid</b> \u00b7 live {:,.2f} ({:+,.0f} pts)'.format(live, drift))
                   parts = []
                   for lab, pv, cur in M['units']:
                       v = risk * pv
@@ -347,6 +415,24 @@ jobs:
                   else:
                       m.append('🎯 Target risk ₹{:,.0f} → 1 lot se {:,.0f} (apne account se compare karein)'
                                .format(tgt, risk * M['units'][0][1]))
+                  K, p0 = 0, 0.0
+                  if M.get('opt'):
+                      oq, ost = M['opt']
+                      K = int(round(bar['c'] / ost) * ost)
+                      call = side == 1
+                      p0 = opt_leg(bar['c'], K, OPT_DAYS, call)
+                      ps = opt_leg(sl, K, OPT_DAYS, call)
+                      pt = opt_leg(tp, K, OPT_DAYS, call)
+                      m += ['─' * 24,
+                            '📈 <b>OPTION MODE</b> · ' + ('BUY CALL (CE)' if call else 'BUY PUT (PE)'),
+                            '🎫 Strike <code>{:,} {}</code>   (ATM · {} din)'.format(
+                                K, 'CE' if call else 'PE', OPT_DAYS),
+                            '💵 Premium ~<code>₹{:,.0f}</code>   → 1 lot = <b>₹{:,.0f}</b>'.format(p0, p0 * oq),
+                            '🛑 SL par option ~₹{:,.0f}   ({:+.0f}%)'.format(ps, (ps - p0) / p0 * 100),
+                            '🎯 TP par option ~₹{:,.0f}   ({:+.0f}%)'.format(pt, (pt - p0) / p0 * 100),
+                            '⏱ Bot ka EXIT message aate hi nikal jao.',
+                            '<i>Premium = BS estimate (IV {:.0f}%), asli quote nahi. '
+                            'VIX high ho to signal chhod dein.</i>'.format(IV_OPT * 100)]
                   m.append('─' * 24)
                   m.append('⏰ Bar band: <b>{}</b> IST · alert {:.0f} min baad'
                            .format(datetime.fromtimestamp(end, IST).strftime('%H:%M'), delay_min))
@@ -362,7 +448,7 @@ jobs:
                         '<i>Verified: ' + M['verified'] + '</i>']
                   send('\n'.join(m))
                   ms['trade'] = {'side': side, 'entry': bar['c'], 'sl': sl, 'tp': tp,
-                                 'risk': risk, 'bar': bar['t']}
+                                 'risk': risk, 'bar': bar['t'], 'K': K, 'p0': p0}
                   changed = True
                   fired += 1
                   print(name, 'SIGNAL SENT')
