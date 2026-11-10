@@ -3,5 +3,15 @@
   "last": 1794330000,
   "trade": null,
   "tf": "60m"
+ },
+ "NIFTY 50": {
+  "last": 1794217500,
+  "trade": null,
+  "tf": "15m"
+ },
+ "SENSEX": {
+  "last": 1794217500,
+  "trade": null,
+  "tf": "15m"
  }
 }
