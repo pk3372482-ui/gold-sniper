@@ -67,6 +67,8 @@ jobs:
           }
           IV_OPT = 0.11
           RATE = 0.065
+          PSL = 0.30   # premium stop-loss: exit at -30% of entry premium
+          PTP = 0.60   # premium take-profit: exit at +60% of entry premium
 
 
           def _closed_days(B):
@@ -337,6 +339,10 @@ jobs:
           for M in MARKETS:
               name = M['name']
               tf = M['interval']
+              # holiday guard: NSE band ho to koi signal nahi (10-Nov, 24-Nov, 25-Dec ...)
+              if M.get('sess') and datetime.fromtimestamp(now, IST).date().isoformat() in HOLIDAYS:
+                  print(name, 'HOLIDAY -- market band, koi signal nahi')
+                  continue
               try:
                   B = bars_for(M)
               except Exception as e:
@@ -382,10 +388,23 @@ jobs:
                   t = ms.get('trade')
                   if t and bar['t'] > t['bar']:
                       hit = None
-                      if t['side'] == 1:
+                      plab = ''
+                      # (a) premium based stop -- fires on option value, not index points
+                      if t.get('K') and t.get('p0') and t.get('psl'):
+                          dl_ = max(t.get('dte', 3) - (bar['t'] - t['bar']) / 86400.0, 0.25)
+                          pn_ = opt_leg(bar['c'], t['K'], dl_, t['side'] == 1)
+                          chg_ = (pn_ - t['p0']) / t['p0'] * 100.0
+                          if pn_ <= t['psl']:
+                              hit = ('SL', bar['c'])
+                              plab = ' \u00b7 premium {:+.0f}%'.format(chg_)
+                          elif pn_ >= t['ptp']:
+                              hit = ('TP', bar['c'])
+                              plab = ' \u00b7 premium {:+.0f}%'.format(chg_)
+                      # (b) index based SL/TP -- backstop
+                      if not hit and t['side'] == 1:
                           hit = ('SL', t['sl']) if bar['l'] <= t['sl'] else (
                                 ('TP', t['tp']) if bar['h'] >= t['tp'] else None)
-                      else:
+                      elif not hit:
                           hit = ('SL', t['sl']) if bar['h'] >= t['sl'] else (
                                 ('TP', t['tp']) if bar['l'] <= t['tp'] else None)
                       if not hit and (bar['t'] - t['bar']) / 60 >= M['tstop'] * M['bar_min']:
@@ -399,7 +418,7 @@ jobs:
                               oline = '\n🎫 {} {} ~₹{:,.0f} → <b>{:+.0f}%</b>'.format(
                                   t['K'], 'CE' if t['side'] == 1 else 'PE', px,
                                   (px - t['p0']) / t['p0'] * 100)
-                          send(('✅' if rr_ > 0 else '❌') + ' <b>EXIT ' + hit[0] + '</b>\n<b>' + name
+                          send(('✅' if rr_ > 0 else '❌') + ' <b>EXIT ' + hit[0] + plab + '</b>\n<b>' + name
                                + '</b> ' + tf + ' ' + ('LONG' if t['side'] == 1 else 'SHORT')
                                + ' @ <code>{:,.2f}</code>\nEntry <code>{:,.2f}</code> → Result: <b>{:+.2f}R</b>'
                                .format(hit[1], t['entry'], rr_) + oline)
@@ -506,6 +525,8 @@ jobs:
                                 exp_d.strftime('%d-%b') if exp_d else '?', dte),
                             '💵 Premium ~<code>₹{:,.0f}</code>   → 1 lot = <b>₹{:,.0f}</b>'.format(p0, p0 * oq),
                             '🛑 SL par option ~₹{:,.0f}   ({:+.0f}%)'.format(ps, (ps - p0) / p0 * 100),
+                            '\U0001f512 Premium stop \u20b9{:,.0f} ({:+.0f}%) \u00b7 target \u20b9{:,.0f} ({:+.0f}%) -- jo PEHLE aaye'.format(
+                                p0 * (1 - PSL), -PSL * 100, p0 * (1 + PTP), PTP * 100),
                             '🎯 TP par option ~₹{:,.0f}   ({:+.0f}%)'.format(pt, (pt - p0) / p0 * 100),
                             '⏱ Bot ka EXIT message aate hi nikal jao.']
                       if exp_note:
@@ -528,6 +549,8 @@ jobs:
                   send('\n'.join(m))
                   ms['trade'] = {'side': side, 'entry': bar['c'], 'sl': sl, 'tp': tp,
                                  'risk': risk, 'bar': bar['t'], 'K': K, 'p0': p0,
+                                 'psl': (p0 * (1.0 - PSL) if M.get('opt') else 0.0),
+                                 'ptp': (p0 * (1.0 + PTP) if M.get('opt') else 0.0),
                                  'dte': (dte if M.get('opt') else 3)}
                   changed = True
                   fired += 1
