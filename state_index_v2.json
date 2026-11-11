@@ -1,6 +1,6 @@
 {
  "NASDAQ 100": {
-  "last": 1794380400,
+  "last": 1794384000,
   "trade": {
    "side": 1,
    "entry": 28175.5,
@@ -17,12 +17,12 @@
   "tf": "60m"
  },
  "NIFTY 50": {
-  "last": 1794385800,
+  "last": 1794386700,
   "trade": null,
   "tf": "15m"
  },
  "SENSEX": {
-  "last": 1794386588,
+  "last": 1794386730,
   "trade": null,
   "tf": "15m"
  }
