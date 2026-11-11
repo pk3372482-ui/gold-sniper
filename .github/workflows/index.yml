@@ -190,18 +190,35 @@ jobs:
               return json.loads(urllib.request.urlopen(r, timeout=30).read())
 
 
+          SEND_FAILS = []
+
+
           def send(txt, dry=''):
+              """Telegram par bhejo. 3 retry, 5 sec gap. Fail ho to SEND_FAILS me record --
+              run ke end me workflow RED ho jayega, taaki failure chhupe nahi."""
               print(txt)
               print()
-              if not (TG and CH) or os.environ.get('DRY_RUN') == '1':
-                  return
+              if os.environ.get('DRY_RUN') == '1':
+                  return True
+              if not (TG and CH):
+                  SEND_FAILS.append('TG_TOKEN / TG_CHAT secret missing')
+                  print('telegram SKIP: TG_TOKEN ya TG_CHAT secret set nahi hai')
+                  return False
               data = urllib.parse.urlencode({'chat_id': CH, 'text': txt, 'parse_mode': 'HTML',
                                              'disable_web_page_preview': 'true'}).encode()
-              try:
-                  urllib.request.urlopen('https://api.telegram.org/bot' + TG + '/sendMessage',
-                                         data=data, timeout=20)
-              except Exception as e:
-                  print('telegram error:', e)
+              last = None
+              for att in range(1, 4):
+                  try:
+                      urllib.request.urlopen('https://api.telegram.org/bot' + TG + '/sendMessage',
+                                             data=data, timeout=20)
+                      return True
+                  except Exception as e:
+                      last = e
+                      print('telegram error (try {}/3): {}'.format(att, e))
+                      if att < 3:
+                          time.sleep(5)
+              SEND_FAILS.append(str(last))
+              return False
 
 
           def ema(v, n):
@@ -335,6 +352,17 @@ jobs:
                   st = {}
           changed = False
           now = now_ts()
+
+          # ---- daily heartbeat: ek din me ek baar. delivery ka proof ----
+          _hbn = datetime.fromtimestamp(now, IST)
+          _hbd = _hbn.date().isoformat()
+          if (_hbn.weekday() < 5 and _hbd not in HOLIDAYS
+                  and _hbn.hour * 60 + _hbn.minute >= 9 * 60 + 15
+                  and st.get('_hb') != _hbd):
+              if send('\U0001f7e2 <b>BOT ZINDA</b> \u00b7 aaj ka scan chalu\n'
+                      '\U0001f4c5 ' + _hbn.strftime('%d-%b-%Y %H:%M') + ' IST \u00b7 NIFTY + SENSEX 15m'):
+                  st['_hb'] = _hbd
+                  changed = True
 
           for M in MARKETS:
               name = M['name']
@@ -571,10 +599,17 @@ jobs:
           if changed:
               json.dump(st, open(STATE, 'w'), indent=1)
               print('state saved')
+
+          if SEND_FAILS:
+              print('!!! TELEGRAM DELIVERY FAILED x{} -- run RED kar raha hoon'.format(len(SEND_FAILS)))
+              for _f in SEND_FAILS[:5]:
+                  print('    ', _f)
+              raise SystemExit(1)
           ENDOFPY
           python3 /tmp/bot.py
 
       - name: State save
+        if: always()
         run: |
           if [ -f state_index_v2.json ]; then
             git config user.name "bot"
