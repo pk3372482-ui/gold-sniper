@@ -1,0 +1,87 @@
+name: NIFTY OI Diagnostic (read only)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check NSE option chain
+        run: |
+          cat > /tmp/oi_test.py <<'ENDOFPY'
+          import json, urllib.request, urllib.parse, time
+          from datetime import datetime, timezone, timedelta
+          IST = timezone(timedelta(hours=5, minutes=30))
+          def nse_json(url):
+              req = urllib.request.Request(url, headers={
+                  'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
+                  'Accept': 'application/json,text/plain,*/*',
+                  'Referer': 'https://www.nseindia.com/option-chain',
+              })
+              with urllib.request.urlopen(req, timeout=12) as response:
+                  return json.load(response)
+
+
+          def nifty_oi_summary(now, allow_stale=False):
+              """Read-only informational snapshot; never used for trading decisions."""
+              today = datetime.fromtimestamp(now, IST).date()
+              base = 'https://www.nseindia.com/api/'
+              dates = nse_json(base + 'option-chain-contract-info?symbol=NIFTY').get('expiryDates', [])
+              expiries = []
+              for text in dates:
+                  try:
+                      day = datetime.strptime(text, '%d-%b-%Y').date()
+                      if day >= today:
+                          expiries.append(day)
+                  except (ValueError, TypeError):
+                      continue
+              if not expiries:
+                  raise ValueError('No valid Nifty expiry found')
+              expiry = min(expiries).strftime('%d-%b-%Y')
+              query = urllib.parse.urlencode({'type': 'Indices', 'symbol': 'NIFTY', 'expiry': expiry})
+              records = nse_json(base + 'option-chain-v3?' + query)['records']
+              source_time = datetime.strptime(records['timestamp'], '%d-%b-%Y %H:%M:%S').replace(tzinfo=IST)
+              age = (now - source_time.timestamp()) / 60.0
+              if age < -2:
+                  raise ValueError('NSE timestamp is in the future')
+              if age > 20 and not allow_stale:
+                  raise ValueError('NSE snapshot stale ({:.0f} min old, as of {} IST)'.format(age, source_time.strftime('%d-%b %H:%M')))
+              rows = records.get('data', [])
+              values = {'CE': [], 'PE': []}
+              for row in rows:
+                  if row.get('expiryDates') != expiry:
+                      continue
+                  strike = row.get('strikePrice')
+                  for side in values:
+                      leg = row.get(side) or {}
+                      oi = leg.get('openInterest')
+                      if isinstance(strike, (int, float)) and isinstance(oi, (int, float)) and oi >= 0:
+                          values[side].append((float(oi), float(strike)))
+              if not values['CE'] or not values['PE']:
+                  raise ValueError('Missing call/put OI for selected expiry')
+              call_sum = sum(v[0] for v in values['CE'])
+              put_sum = sum(v[0] for v in values['PE'])
+              if call_sum <= 0:
+                  raise ValueError('Call OI total is zero')
+              call_top = sorted(values['CE'], reverse=True)[:2]
+              put_top = sorted(values['PE'], reverse=True)[:2]
+              def fmt(items):
+                  return ', '.join('{:,.0f} ({:,.0f})'.format(k, oi) for oi, k in items)
+              return ('📊 <b>NSE NIFTY OI (info only)</b>\n'
+                      'Expiry {} · {} IST · {}\n'
+                      'Spot reference {:,.2f} · PCR {:.2f}\n'
+                      'Top CE strikes: {}\nTop PE strikes: {}\n'
+                      '<i>OI raw provider units; concentrations are not guaranteed support/resistance.</i>'
+                      .format(expiry, source_time.strftime('%d-%b %H:%M'), 'STALE' if age > 20 else 'fresh',
+                              float(records['underlyingValue']), put_sum / call_sum, fmt(call_top), fmt(put_top)))
+
+          try:
+              print(nifty_oi_summary(time.time(), allow_stale=True))
+              print("Connectivity verified. STALE after market close is expected; do not use as live data.")
+          except Exception as e:
+              print('OI diagnostic failed:', type(e).__name__, str(e)[:200])
+              raise SystemExit(1)
+          ENDOFPY
+          python3 /tmp/oi_test.py
