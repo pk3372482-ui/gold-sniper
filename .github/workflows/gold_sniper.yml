@@ -10,6 +10,11 @@ on:
 permissions:
   contents: write
 
+# Avoid overlapping gold runs updating the same state concurrently.
+concurrency:
+  group: gold-sniper-state
+  cancel-in-progress: false
+
 jobs:
   scan:
     runs-on: ubuntu-latest
@@ -52,15 +57,27 @@ jobs:
           def send(txt):
               print(txt)
               print()
-              if not (TG and CH) or os.environ.get('DRY_RUN') == '1':
-                  return
+              if os.environ.get('DRY_RUN') == '1':
+                  return True
+              if not (TG and CH):
+                  print('Telegram credentials missing; delivery failed.')
+                  return False
               data = urllib.parse.urlencode({'chat_id': CH, 'text': txt, 'parse_mode': 'HTML',
                                              'disable_web_page_preview': 'true'}).encode()
-              try:
-                  urllib.request.urlopen('https://api.telegram.org/bot' + TG + '/sendMessage',
-                                         data=data, timeout=20)
-              except Exception as e:
-                  print('telegram error:', e)
+              for attempt in range(1, 4):
+                  try:
+                      with urllib.request.urlopen('https://api.telegram.org/bot' + TG + '/sendMessage',
+                                                  data=data, timeout=20) as response:
+                          result = json.loads(response.read())
+                      if not result.get('ok'):
+                          raise RuntimeError('Telegram API reported unsuccessful delivery')
+                      return True
+                  except Exception as e:
+                      safe = str(e).replace(TG, '[REDACTED]')
+                      print('Telegram delivery failed (try {}/3): {}'.format(attempt, safe))
+                      if attempt < 3:
+                          time.sleep(5)
+              return False
 
 
           def ema(v, n):
@@ -98,6 +115,9 @@ jobs:
           while B and B[-1]['t'] + 3600 > time.time():
               B.pop()
 
+          if len(B) < max(ET, ES, EF) + 60:
+              raise SystemExit('Insufficient completed gold candles; scan stopped.')
+
           C = [b['c'] for b in B]
           H = [b['h'] for b in B]
           L = [b['l'] for b in B]
@@ -115,8 +135,8 @@ jobs:
           if os.path.exists(STATE):
               try:
                   st = json.load(open(STATE))
-              except Exception:
-                  pass
+              except Exception as e:
+                  raise SystemExit('Gold state unreadable; scan stopped: {}'.format(e))
           changed = False
           now = time.time()
 
@@ -150,9 +170,11 @@ jobs:
                       hit = ('TIME', bar['c'])
                   if hit:
                       rr_ = (hit[1] - t['entry']) * t['side'] / t['risk']
-                      send(('✅' if rr_ > 0 else '❌') + ' <b>EXIT ' + hit[0] + '</b>\n' + NAME + ' 1H '
+                      delivered = send(('✅' if rr_ > 0 else '❌') + ' <b>EXIT ' + hit[0] + '</b>\n' + NAME + ' 1H '
                            + ('LONG' if t['side'] == 1 else 'SHORT')
                            + ' @ <code>{:,.2f}</code>\nResult: <b>{:+.2f}R</b>'.format(hit[1], rr_))
+                      if not delivered:
+                          raise SystemExit('EXIT alert not delivered; state not advanced.')
                       st['trade'] = None
                       changed = True
 
@@ -194,11 +216,11 @@ jobs:
                     '🎯 <b>TP</b>     <code>{:,.2f}</code>'.format(tp),
                     '⚖️ <b>RR</b>     1:{:g}'.format(RR),
                     '📏 <b>Risk</b>   {:,.2f} (2.5×ATR)'.format(risk),
-                    '📦 <b>SIZE</b>   <b>{:.2f} lot</b>  → MT5 mein yahi daalein'.format(lots)]
+                    '📦 <b>SIZE estimate</b>   <b>{:.2f} lot</b>  → broker contract/lot size verify karein'.format(lots)]
               if tgt / per < 0.01:
                   m.append('⚠️ <b>WARNING:</b> min lot {:.2f} par risk <b>{:.1f}%</b> ({:,.2f}), '
                            'na ki {:g}% ({:,.2f}).'.format(lots, act / BAL * 100, act, RP, tgt))
-                  m.append('<i>Safe {:g}% ke liye balance kam se kam {:,.0f} chahiye.</i>'.format(RP, act * 200))
+                  m.append('<i>Safe {:g}% ke liye balance kam se kam {:,.0f} chahiye.</i>'.format(RP, act * 100 / RP if RP > 0 else float('inf')))
               else:
                   m.append('<i>Target {:g}% of {:,.0f} = {:,.2f} → actual {:,.2f} (lot rounding)</i>'
                            .format(RP, BAL, tgt, act))
@@ -209,7 +231,8 @@ jobs:
                     '',
                     '<i>Levels futures par. Broker par DIST use karein.</i>',
                     '<i>Verified: 43.7% WR · PF 1.22 · 474 trades</i>']
-              send('\n'.join(m))
+              if not send('\n'.join(m)):
+                  raise SystemExit('ENTRY alert not delivered; state not advanced.')
               st['trade'] = {'side': side, 'entry': bar['c'], 'sl': sl, 'tp': tp, 'risk': risk, 'bar': bar['t']}
               changed = True
               fired += 1
@@ -233,7 +256,15 @@ jobs:
             git add state.json
             if ! git diff --staged --quiet; then
               git commit -m "state"
-              git pull --rebase --autostash || true
-              git push || true
+              saved=0
+              for attempt in 1 2 3; do
+                git pull --rebase --autostash || { echo "State rebase failed; inspect conflict."; exit 1; }
+                if git push; then saved=1; break; fi
+                echo "State push failed (attempt $attempt/3). Retrying."
+              done
+              if [ "$saved" -ne 1 ]; then
+                echo "Gold state was not saved. Investigate before relying on alerts."
+                exit 1
+              fi
             fi
           fi
