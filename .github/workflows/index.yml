@@ -11,6 +11,11 @@ on:
 permissions:
   contents: write
 
+# Prevent concurrent runs of this workflow from overwriting its state.
+concurrency:
+  group: index-alerts-v2-state
+  cancel-in-progress: false
+
 jobs:
   scan:
     runs-on: ubuntu-latest
@@ -191,6 +196,7 @@ jobs:
 
 
           SEND_FAILS = []
+          DATA_FAILS = []
 
 
           def send(txt, dry=''):
@@ -213,8 +219,8 @@ jobs:
                                              data=data, timeout=20)
                       return True
                   except Exception as e:
-                      last = e
-                      print('telegram error (try {}/3): {}'.format(att, e))
+                      last = str(e).replace(TG, '[REDACTED]') if TG else str(e)
+                      print('telegram error (try {}/3): {}'.format(att, last))
                       if att < 3:
                           time.sleep(5)
               SEND_FAILS.append(str(last))
@@ -375,10 +381,12 @@ jobs:
                   B = bars_for(M)
               except Exception as e:
                   print(name, 'data error:', e)
+                  DATA_FAILS.append(name + ': data fetch failed')
                   continue
               need = max(M['es'], 200) + 60
               if len(B) < need:
                   print(name, 'not enough bars:', len(B), '<', need)
+                  DATA_FAILS.append(name + ': insufficient bars')
                   continue
 
               C, fE, sE, tE, A, RSI, ADX = indicators(B, M['ef'], M['es'])
@@ -446,10 +454,12 @@ jobs:
                               oline = '\n🎫 {} {} ~₹{:,.0f} → <b>{:+.0f}%</b>'.format(
                                   t['K'], 'CE' if t['side'] == 1 else 'PE', px,
                                   (px - t['p0']) / t['p0'] * 100)
-                          send(('✅' if rr_ > 0 else '❌') + ' <b>EXIT ' + hit[0] + plab + '</b>\n<b>' + name
+                          delivered = send(('✅' if rr_ > 0 else '❌') + ' <b>EXIT ' + hit[0] + plab + '</b>\n<b>' + name
                                + '</b> ' + tf + ' ' + ('LONG' if t['side'] == 1 else 'SHORT')
                                + ' @ <code>{:,.2f}</code>\nEntry <code>{:,.2f}</code> → Result: <b>{:+.2f}R</b>'
                                .format(hit[1], t['entry'], rr_) + oline)
+                          if not delivered:
+                              raise SystemExit('EXIT alert failed; market state not advanced. Retry required.')
                           ms['trade'] = None
                           changed = True
 
@@ -574,7 +584,8 @@ jobs:
                         '<i>Levels index par. Broker par DIST use karein.</i>',
                         '<i>' + M['note'] + '</i>',
                         '<i>Verified: ' + M['verified'] + '</i>']
-                  send('\n'.join(m))
+                  if not send('\n'.join(m)):
+                      raise SystemExit('ENTRY alert failed; market state not advanced. Retry required.')
                   ms['trade'] = {'side': side, 'entry': bar['c'], 'sl': sl, 'tp': tp,
                                  'risk': risk, 'bar': bar['t'], 'K': K, 'p0': p0,
                                  'psl': (p0 * (1.0 - PSL) if M.get('opt') else 0.0),
@@ -586,6 +597,8 @@ jobs:
 
               ms['last'] = B[-1]['t']
               changed = True
+              # Checkpoint each finished market; do not advance a failed alert.
+              json.dump(st, open(STATE, 'w'), indent=1)
               if not fired:
                   extra = ' ({} late skip)'.format(skipped_late) if skipped_late else ''
                   print('{}: no new signal{}'.format(name, extra))
@@ -600,8 +613,10 @@ jobs:
               json.dump(st, open(STATE, 'w'), indent=1)
               print('state saved')
 
-          if SEND_FAILS:
-              print('!!! TELEGRAM DELIVERY FAILED x{} -- run RED kar raha hoon'.format(len(SEND_FAILS)))
+          if DATA_FAILS:
+              print('!!! DATA ERRORS:', '; '.join(DATA_FAILS))
+          if SEND_FAILS or DATA_FAILS:
+              print('!!! Delivery/data errors: run marked failed ({} delivery, {} data)'.format(len(SEND_FAILS), len(DATA_FAILS)))
               for _f in SEND_FAILS[:5]:
                   print('    ', _f)
               raise SystemExit(1)
@@ -617,7 +632,17 @@ jobs:
             git add state_index_v2.json
             if ! git diff --staged --quiet; then
               git commit -m "state index v2"
-              git pull --rebase --autostash || true
-              git push || true
+              # Do not hide failed state persistence. Rebase remote updates and
+              # retry rejected pushes; a conflict fails visibly for manual review.
+              saved=0
+              for attempt in 1 2 3; do
+                git pull --rebase --autostash || { echo "State rebase failed; inspect conflict."; exit 1; }
+                if git push; then saved=1; break; fi
+                echo "State push failed (attempt $attempt/3). Retrying."
+              done
+              if [ "$saved" -ne 1 ]; then
+                echo "State was not saved to GitHub. Investigate before relying on alerts."
+                exit 1
+              fi
             fi
           fi
