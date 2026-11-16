@@ -1,4 +1,7 @@
 # GOLD SNIPER V3 — sab kuch isi ek file mein hai
+# v2.1 (16-Nov, shaam): State save me retry ke beech SLEEP (4/8/12/16s, 5 koshish).
+#      v2 ke 3 retry bina rukhe the -> index bot ke saath push takra kar fail.
+#      Trading logic me KOI change nahi.
 # v2 (16-Nov-2026): TSTOP 40h -> 24h. Alert me hardcoded '2.5xATR' aur
 #     purana 'verified' line hata diya. Daily heartbeat add kiya.
 #     SLATR 2.5 hi rakha -- backtest me chhota karne ka koi fayda nahi.
@@ -270,10 +273,17 @@ jobs:
             if ! git diff --staged --quiet; then
               git commit -m "state"
               saved=0
-              for attempt in 1 2 3; do
-                git pull --rebase --autostash || { echo "State rebase failed; inspect conflict."; exit 1; }
+              # v2.1: har retry ke baad SLEEP. 16-Nov 13:00 aur 13:02 par 3 retry
+              # bina rukhe 1 second me khatam ho gaye -> teeno fail. Index bot ke
+              # saath push takra raha tha. Ab 4s/8s/12s/16s ruk kar koshish.
+              for attempt in 1 2 3 4 5; do
+                if ! git pull --rebase --autostash; then
+                  echo "State rebase failed; inspect conflict."
+                  exit 1
+                fi
                 if git push; then saved=1; break; fi
-                echo "State push failed (attempt $attempt/3). Retrying."
+                echo "State push failed (attempt $attempt/5). Sleeping $((attempt * 4))s."
+                sleep $((attempt * 4))
               done
               if [ "$saved" -ne 1 ]; then
                 echo "Gold state was not saved. Investigate before relying on alerts."
