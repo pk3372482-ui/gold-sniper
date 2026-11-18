@@ -1,4 +1,7 @@
 # GOLD SNIPER V3 — sab kuch isi ek file mein hai
+# v2.2 (18-Nov): BAR-BAND GUARD -- aadhi ban rahi / stale candle par kaam nahi.
+#      Yahoo futures 10-16 min late hai; v2.1 us adhoori price par entry le raha tha.
+#      Trading logic me KOI change nahi.
 # v2.1 (16-Nov, shaam): State save me retry ke beech SLEEP (4/8/12/16s, 5 koshish).
 #      v2 ke 3 retry bina rukhe the -> index bot ke saath push takra kar fail.
 #      Trading logic me KOI change nahi.
@@ -120,7 +123,17 @@ jobs:
               o, h, l, c = q['open'][i], q['high'][i], q['low'][i], q['close'][i]
               if None not in (o, h, l, c) and c > 0:
                   B.append({'t': t, 'o': o, 'h': h, 'l': l, 'c': c})
-          while B and B[-1]['t'] + 3600 > time.time():
+          # v2.2 BAR-BAND GUARD: Yahoo futures ka feed ~10-16 minute purana hota hai.
+          # v2.1 me sirf "bar ka end abhi se pehle hai?" dekha jata tha -- isliye 60-min bar
+          # band hone ke 1 second baad hi us par signal ban jata tha, jabki us candle me data
+          # sirf ~15:50 tak ka tha. Us adhoori candle ka 'close' chart ka close nahi tha.
+          # Proof (17-Nov): NASDAQ ki 15:00 candle O 27313.75 H 27337.25 L 26658.50 C 26922.75
+          # thi, par bot ne 26782.50 pakda -- 140 point galat. GOLD me 8 me se 7 entry galat.
+          # Ab do shart: (a) bar grid par ho (t % 3600 == 0 -- 18:30 ka off-grid stub khatam),
+          # (b) bar band hone ke baad kam se kam LAG_SEC guzar chuke hon.
+          # Signals ~20 min late aayenge, par price SAHI hogi. Trading logic me koi change nahi.
+          LAG_SEC = 1200
+          while B and (B[-1]['t'] + 3600 > time.time() - LAG_SEC or B[-1]['t'] % 3600 != 0):
               B.pop()
 
           if len(B) < max(ET, ES, EF) + 60:
