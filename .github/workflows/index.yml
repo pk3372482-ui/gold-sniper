@@ -182,7 +182,7 @@ jobs:
               dict(name='NIFTY 50', sym='^NSEI', interval='15m', rng='60d', bar_min=15,
                    ef=9, es=50, sl=3.0, lb=3, adx=0, rr=2.0, tstop=25, catchup=200,
                    sess=(9 * 60 + 15, 15 * 60 + 30), gate=14 * 60 + 30, maxdelay=45,
-                   eod=15 * 60,
+                   eod=15 * 60, lag=300,
                    units=[('Fut 1 lot', 65, 'INR')], opt=(65, 50, 3),
                    note='NIFTY lot = 65 qty. Option: OTM3, auto expiry (Tuesday).',
                    verified='PF 1.50 | 57 trades | 49.1% WR | 60 din | 3/4 fold pass'),
@@ -190,14 +190,14 @@ jobs:
               dict(name='SENSEX', sym='^BSESN', interval='15m', rng='60d', bar_min=15,
                    ef=9, es=200, sl=3.0, lb=3, adx=0, rr=2.0, tstop=25, catchup=200,
                    sess=(9 * 60 + 15, 15 * 60 + 30), gate=14 * 60 + 30, maxdelay=45,
-                   eod=15 * 60,
+                   eod=15 * 60, lag=1200,
                    units=[('Fut 1 lot', 20, 'INR')], opt=(20, 100, 3),
                    note='SENSEX lot = 20 qty. Option: OTM3, auto expiry (Thursday).',
                    verified='PF 1.40 | 57 trades | 49.1% WR | 60 din | 4/4 fold pass'),
 
               dict(name='NASDAQ 100', sym='NQ=F', interval='60m', rng='6mo', bar_min=60,
                    ef=9, es=50, sl=2.5, lb=3, adx=0, rr=2.0, tstop=40, catchup=48,
-                   sess=None, gate=None, maxdelay=90,
+                   sess=None, gate=None, maxdelay=90, lag=1200,
                    units=[('MNQ', 2, 'USD'), ('NQ', 20, 'USD')],
                    note='MNQ min size mehnga hai. Broker NAS100 CFD (fractional lot) deta hai to wahi lein.',
                    verified='PF 1.18 | 497 trades | 43.5% WR'),
@@ -432,8 +432,18 @@ jobs:
                       continue
                   if M['sess'] and ist_min(t) >= M['sess'][1]:
                       continue                      # 15:30 ka stub bar -- phenk do
-                  if bar_end(M, t) > now:
-                      continue                      # abhi band nahi hua
+                  # v12.2 BAR-BAND GUARD. Pehle sirf "bar_end > now" dekhte the, par Yahoo ka
+                  # feed 10-16 min purana hota hai -- isliye bar band hone ke turant baad usme
+                  # adhoora data hota tha aur bot galat close par entry/exit leta tha.
+                  # Proof: NIFTY ki 6/6 entry exact (NSE LTP se aati hai), par SENSEX 6/6 aur
+                  # NASDAQ 5/6 galat -- 140-145 point tak. Ab do shart:
+                  #   (a) lag -- bar band hone ke baad M['lag'] second ruko (feed final ho jaye),
+                  #   (b) grid -- bar bar_min ke grid par ho (off-grid stub phenk do).
+                  lag = M.get('lag', 300)
+                  if bar_end(M, t) > now - lag:
+                      continue                      # abhi band nahi hua, ya data abhi final nahi
+                  if (M['bar_min'] * 60) and t % (M['bar_min'] * 60) != 0:
+                      continue                      # off-grid stub bar
                   B.append({'t': t, 'o': o, 'h': h, 'l': l, 'c': c})
               return B
 
