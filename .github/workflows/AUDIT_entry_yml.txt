@@ -1,0 +1,233 @@
+# ENTRY AUDIT — mera bug pakadne wala checker (v1.0, 18-Nov-2026)
+# Ye bot NAHI hai. Koi trade nahi karta, koi state nahi badalta, koi signal nahi bhejta.
+# Kaam ek hi: har 20 min me jo trade khula hai, uska ENTRY price Yahoo ke ASLI bar
+# close se milata hai. Farq 0.02% se zyada ho to Telegram par laal alert + workflow red.
+# Matlab: agar main (ya koi bhi) galti se aadhi candle wala code chadha de, to pata
+# 2 din baad nahi -- 20 minute me chal jayega. Ye is poore system ka "bug insurance" hai.
+# Github par file ka naam:  .github/workflows/audit_entry.yml
+name: Entry Audit
+
+on:
+  schedule:
+    - cron: '*/20 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: entry-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Audit chalayein
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+        run: |
+          cat > /tmp/audit.py <<'ENDOFPY'
+          import json, os, time, urllib.request, urllib.parse
+          from datetime import datetime, timezone
+
+          TG = os.environ.get('TG_TOKEN', '')
+          CH = os.environ.get('TG_CHAT', '')
+          DRY = os.environ.get('DRY_RUN') == '1'
+          TOL = 0.02          # percent -- isse zyada farq = bug
+          LAG = 1200          # bar band hone ke baad itna waqt, tab bar "final" hai
+          ASTATE = 'audit_state.json'
+          # bar-band guard jab live chadha (18-Nov 18:52 UTC). Isse purane bars
+          # purane code ke hain -- unhe "LEGACY" dikhayenge, fail nahi.
+          CUTOFF = 1795027920
+          IST_OFF = 5 * 3600 + 1800
+
+          JOBS = [
+              dict(state='state.json', name='GOLD', sym='GC=F',
+                   interval='60m', rng='6mo', bar_min=60, rr=2.0),
+              dict(state='state_index_v2.json', name='NIFTY 50', sym='^NSEI',
+                   interval='15m', rng='60d', bar_min=15, rr=2.0),
+              dict(state='state_index_v2.json', name='SENSEX', sym='^BSESN',
+                   interval='15m', rng='60d', bar_min=15, rr=2.0),
+              dict(state='state_index_v2.json', name='NASDAQ 100', sym='NQ=F',
+                   interval='60m', rng='6mo', bar_min=60, rr=2.0),
+          ]
+
+
+          def get(url):
+              r = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+              return json.loads(urllib.request.urlopen(r, timeout=25).read())
+
+
+          def send(txt):
+              print(txt)
+              if DRY:
+                  return True
+              if not (TG and CH):
+                  print('TG credentials missing')
+                  return False
+              data = urllib.parse.urlencode({'chat_id': CH, 'text': txt,
+                                             'parse_mode': 'HTML',
+                                             'disable_web_page_preview': 'true'}).encode()
+              for _ in range(3):
+                  try:
+                      with urllib.request.urlopen(
+                              'https://api.telegram.org/bot' + TG + '/sendMessage',
+                              data=data, timeout=20) as r:
+                          if json.loads(r.read()).get('ok'):
+                              return True
+                  except Exception as e:
+                      print('tg fail', str(e).replace(TG, 'X'))
+                      time.sleep(4)
+              return False
+
+
+          def bars(sym, interval, rng):
+              d = get('https://query1.finance.yahoo.com/v8/finance/chart/' + sym
+                      + '?interval=' + interval + '&range=' + rng)
+              res = d['chart']['result'][0]
+              q = res['indicators']['quote'][0]
+              return {t: q['close'][i] for i, t in enumerate(res['timestamp'])
+                      if q['close'][i]}
+
+
+          now = time.time()
+          prev = {}
+          if os.path.exists(ASTATE):
+              try:
+                  prev = json.load(open(ASTATE))
+              except Exception:
+                  prev = {}
+          cur, problems, lines = {}, [], []
+          checked = 0
+
+          for J in JOBS:
+              try:
+                  st = json.load(open(J['state']))
+              except Exception as e:
+                  problems.append(J['state'] + ' padhi nahi gayi: ' + str(e))
+                  continue
+              blk = st.get(J['name']) if J['name'] in st else st
+              if not isinstance(blk, dict):
+                  continue
+              try:
+                  C = bars(J['sym'], J['interval'], J['rng'])
+              except Exception as e:
+                  lines.append('  {}: data fail ({})'.format(J['name'], e))
+                  continue
+              step = J['bar_min'] * 60
+
+              # --- check 0: bot chal raha hai? (cron band ho jaye to pakda jaye)
+              fin = [t for t in C if now >= t + step + LAG]
+              if fin:
+                  newest = max(fin)
+                  if (newest - (blk.get('last') or 0) > 3 * step
+                          and newest > now - 3 * 3600):
+                      miss = int((newest - (blk.get('last') or 0)) / step)
+                      problems.append('SCAN MISS: {} ka state {} bar peeche hai '
+                                      '(cron band ya fail). Last bar {}'.format(
+                                          J['name'], miss,
+                                          datetime.fromtimestamp(newest + IST_OFF,
+                                                                 timezone.utc).strftime('%d-%b %H:%M')))
+
+              tr = blk.get('trade')
+              if not tr:
+                  lines.append('  {}: FLAT'.format(J['name']))
+                  continue
+              bt = tr.get('bar')
+              key = '{}|{}|{}'.format(J['state'], J['name'], bt)
+              entry = float(tr['entry'])
+
+              # --- check 1: bar grid par hai? (off-grid stub = bug)
+              offgrid = (bt is None) or (bt % step != 0)
+              # --- check 2: asli close
+              real = C.get(bt)
+              diff = (entry - real) / real * 100 if real else None
+              # --- check 3: SL/TP side + RR
+              sl, tp, side = float(tr.get('sl', 0)), float(tr.get('tp', 0)), int(tr.get('side', 0))
+              side_ok = (sl < entry < tp) if side > 0 else (tp < entry < sl) if side < 0 else False
+              risk = abs(entry - sl)
+              rr = abs(tp - entry) / risk if risk > 0 else 0
+              rr_ok = 1.4 <= rr <= 2.6 and abs(rr - J['rr']) < 0.5
+              # --- check 4: bar kitna purana (final hua ya nahi)
+              final_at = bt + step + LAG
+              is_final = now >= final_at
+              legacy = bt + step < CUTOFF
+
+              checked += 1
+              if offgrid:
+                  v = 'ALERT'
+              elif diff is None:
+                  v = 'NODATA'
+              elif abs(diff) > TOL:
+                  v = 'LEGACY' if legacy else 'MISMATCH'
+              elif not side_ok or not rr_ok:
+                  v = 'WARN'
+              else:
+                  v = 'OK'
+
+              when = datetime.fromtimestamp(bt + IST_OFF, timezone.utc).strftime('%d-%b %H:%M') if bt else '?'
+              lines.append('  {}: {} bar {} IST | entry {:.2f} | asli {:.2f} | diff {}{}'.format(
+                  J['name'], v, when, entry, real if real else 0,
+                  '{:+.3f}%'.format(diff) if diff is not None else 'n/a',
+                  '' if is_final else ' (bar abhi final nahi)'))
+
+              if v in ('MISMATCH', 'ALERT', 'WARN'):
+                  problems.append((J, v, when, entry, real, diff, rr, is_final, bt))
+              cur[key] = v
+
+          # ---- Telegram: sirf naye problem par (spam nahi)
+          for p in problems:
+              if not isinstance(p, tuple):
+                  send('\U0001f534 <b>AUDIT PROBLEM</b>\n' + str(p))
+                  continue
+              J, v, when, entry, real, diff, rr, is_final, bt = p
+              key = '{}|{}|{}'.format(J['state'], J['name'], bt)
+              if prev.get(key) == v:
+                  continue
+              head = {'MISMATCH': '\U0001f534 <b>AUDIT FAIL -- ENTRY PRICE GALAT</b>',
+                      'ALERT': '\U0001f534 <b>AUDIT FAIL -- BAR GRID PAR NAHI</b>',
+                      'WARN': '\U0001f7e1 <b>AUDIT WARNING -- SL/TP ya RR galat</b>'}[v]
+              body = (head + '\n\n<b>' + J['name'] + '</b> bar ' + when + ' IST'
+                      + '\nEntry <code>{:.2f}</code>'.format(entry))
+              if real:
+                  body += '  vs asli close <code>{:.2f}</code>'.format(real)
+              if diff is not None:
+                  body += '\nFarq <b>{:+.3f}%</b> (limit {:+.2f}%)'.format(diff, TOL)
+              if not is_final:
+                  body += '\n<i>Note: bar abhi final nahi hua tha.</i>'
+              body += '\n\n<i>Ye ALERT bot ka signal nahi hai -- code ki galti ka proof hai.</i>'
+              send(body)
+              cur[key] = v
+
+          json.dump(cur, open(ASTATE, 'w'), indent=1)
+          print('audit: {} trade checked'.format(checked))
+          print('\n'.join(lines))
+          bad = [p for p in problems if isinstance(p, tuple) and p[1] in ('MISMATCH', 'ALERT')]
+          if bad:
+              print('!!! AUDIT FAIL: {} trade(s) galat. Run red mark hoga.'.format(len(bad)))
+              raise SystemExit(1)
+          print('AUDIT OK')
+          ENDOFPY
+          python3 /tmp/audit.py
+
+      - name: Audit state save
+        if: always()
+        run: |
+          if [ -f audit_state.json ]; then
+            git config user.name "audit"
+            git config user.email "audit@users.noreply.github.com"
+            git add audit_state.json
+            if ! git diff --staged --quiet; then
+              git commit -m "audit state"
+              for attempt in 1 2 3 4 5; do
+                git pull --rebase --autostash || exit 1
+                if git push; then break; fi
+                echo "audit push failed ($attempt/5)"; sleep $((attempt * 4))
+              done
+            fi
+          fi
