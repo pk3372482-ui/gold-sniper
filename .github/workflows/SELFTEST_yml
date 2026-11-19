@@ -1,0 +1,171 @@
+# SELFTEST — har upload par khud chalne wala check (v1.0, 19-Nov-2026)
+# Ye bot NAHI hai. Trade nahi karta, state nahi badalta. Sirf 20 check chalata hai
+# aur FAIL hone par Telegram par laal message bhejta hai + workflow red karta hai.
+# Kyun: 18-Nov ko audit file ka naam AUDIT_entry_yml tha (bina .yml) -- GitHub ne
+# workflow maana hi nahi. Aise mistakes aage khud pakdi jayen, aapko dhoondhni na pade.
+# Github par file ka naam:  .github/workflows/selftest.yml
+name: Self Test
+
+on:
+  push:
+    paths:
+      - '.github/workflows/**'
+  schedule:
+    - cron: '20 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Self test chalayein
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+        run: |
+          cat > /tmp/selftest.py <<'ENDOFPY'
+          import os, re, sys, json, glob, tempfile, py_compile, urllib.parse, urllib.request
+
+          WF = '.github/workflows'
+          TG = os.environ.get('TG_TOKEN', '')
+          CH = os.environ.get('TG_CHAT', '')
+          ok, warn, fail = [], [], []
+
+
+          def P(name, cond, msg=''):
+              (ok if cond else fail).append(name + ((' -- ' + msg) if msg and not cond else ''))
+
+
+          def W(name, cond, msg=''):
+              if not cond:
+                  warn.append(name + ((' -- ' + msg) if msg else ''))
+
+
+          def send(txt):
+              print(txt)
+              if not (TG and CH):
+                  print('tg skip')
+                  return
+              data = urllib.parse.urlencode({'chat_id': CH, 'text': txt, 'parse_mode': 'HTML',
+                                             'disable_web_page_preview': 'true'}).encode()
+              try:
+                  urllib.request.urlopen('https://api.telegram.org/bot' + TG + '/sendMessage',
+                                         data=data, timeout=20).read()
+              except Exception as e:
+                  print('tg fail', str(e).replace(TG, 'X'))
+
+
+          # ---------- 1) file names ----------
+          files = sorted(os.listdir(WF))
+          # 18-Nov wali asli galti: file ka naam AUDIT_entry_yml tha -- bina DOT.
+          # Aise file ko GitHub workflow maanta hi nahi. Wo FAIL hai.
+          no_dot = [f for f in files if '.' not in f]
+          P('workflow file names me .yml hai', not no_dot,
+            'in naam me extension hi nahi: ' + ', '.join(no_dot))
+          W('workflows folder me faltu backup files', not any(f.endswith('.txt') for f in files),
+            'ye files Actions nahi hain: ' + ', '.join(f for f in files if f.endswith('.txt')))
+
+          # ---------- 2) YAML parse ----------
+          try:
+              import yaml
+          except ImportError:
+              yaml = None
+          texts = {}
+          for f in files:
+              if f.endswith(('.yml', '.yaml')):
+                  texts[f] = open(os.path.join(WF, f), encoding='utf-8').read()
+          for f, t in texts.items():
+              if yaml:
+                  try:
+                      yaml.safe_load(t)
+                      ok.append('YAML parse: ' + f)
+                  except Exception as e:
+                      fail.append('YAML parse FAIL: {} -- {}'.format(f, str(e)[:90]))
+
+          # ---------- 3) embedded python compile ----------
+          def code_of(t):
+              m = re.search(r"cat > /tmp/\w+\.py <<'ENDOFPY'\n(.*?)\n\s*ENDOFPY", t, re.S)
+              if not m:
+                  return None
+              import textwrap
+              return textwrap.dedent(m.group(1))
+
+          for f in ('index.yml', 'gold_sniper.yml', 'audit_entry.yml'):
+              if f not in texts:
+                  fail.append('MISSING file: ' + f)
+                  continue
+              c = code_of(texts[f])
+              if c is None:
+                  fail.append('python block nahi mila: ' + f)
+                  continue
+              p = tempfile.mktemp(suffix='.py')
+              open(p, 'w').write(c)
+              try:
+                  py_compile.compile(p, doraise=True)
+                  ok.append('python compile: ' + f)
+              except Exception as e:
+                  fail.append('COMPILE FAIL: {} -- {}'.format(f, str(e)[:120]))
+
+          # ---------- 4) guard + features maujood hain ----------
+          ix = texts.get('index.yml', '')
+          gd = texts.get('gold_sniper.yml', '')
+          au = texts.get('audit_entry.yml', '')
+          P('index: bar-band guard (lag)', "M.get('lag'" in ix and 'lag=300' in ix and 'lag=1200' in ix)
+          P('index: asli NSE premium (live)', 'real_premium' in ix and 'def real_premium' in ix)
+          P('gold: bar-band guard', 'LAG_SEC = 1200' in gd and "% 3600 != 0" in gd)
+          P('audit: mismatch detection', 'AUDIT FAIL' in au and 'audit_state.json' in au)
+          P('index: PSL/PTP maujood', 'psl' in ix and 'ptp' in ix)
+          P('gold: TSTOP 24h',
+            any('TSTOP' in ln and re.search(r'\b24\b', ln) for ln in gd.split('\n'))
+            and 'TSTOP' in gd)
+
+          # ---------- 5) cron shart ----------
+          for f, want in (('index.yml', '*/2'), ('gold_sniper.yml', '*/15'), ('audit_entry.yml', '*/20')):
+              t = texts.get(f, '')
+              W('cron {} = {}'.format(f, want), "cron: '{} ".format(want) in t)
+
+          # ---------- 6) state files valid ----------
+          for sf, key in (('state.json', 'last'), ('state_index_v2.json', 'NIFTY 50')):
+              try:
+                  st = json.load(open(sf))
+                  P('state {} valid JSON'.format(sf), key in st or sf == 'state.json')
+              except Exception as e:
+                  fail.append('state {} padhi nahi gayi -- {}'.format(sf, str(e)[:80]))
+
+          # ---------- 7) GUARD UNIT TEST (asli regression test) ----------
+          # gold bot ka rule: bar grid par ho + band hone ke baad LAG_SEC guzar chuke hon
+          LAG = 1200
+          STEP = 3600
+          now = 1000000
+          def ok_bar(t):
+              return not (t + STEP > now - LAG or t % STEP != 0)
+          cases = [
+              (now - 3600, False, 'abhi band hua bar (adhoore data) -> REJECT'),
+              (now - 3600 + 1, False, 'in-flight bar -> REJECT'),
+              ((now // STEP) * STEP - 1800, False, 'off-grid stub -> REJECT'),
+              ((now // STEP) * STEP - STEP, True, 'pichhla poora bar -> ACCEPT'),
+          ]
+          bad = [msg for t, want, msg in cases if ok_bar(t) != want]
+          P('guard unit test (4 case)', not bad, '; '.join(bad))
+
+          # ---------- 8) report ----------
+          head = ('\U0001f534 <b>SELFTEST FAIL</b>  ({} check fail)' if fail else
+                  '\U0001f7e2 <b>SELFTEST OK</b>  ({} check pass)').format(len(fail) if fail else len(ok))
+          body = [head, '']
+          if fail:
+              body += ['<b>FAIL:</b>'] + ['\u2022 ' + x for x in fail[:12]]
+          if warn:
+              body += ['', '<b>Warning:</b>'] + ['\u2022 ' + x for x in warn[:8]]
+          body += ['', '<i>Ye message code ki sehat ke liye hai. Trade par asar nahi.</i>']
+          send('\n'.join(body))
+          print('\nPASS:', len(ok), '| WARN:', len(warn), '| FAIL:', len(fail))
+          if fail:
+              raise SystemExit(1)
+          ENDOFPY
+          python3 /tmp/selftest.py
