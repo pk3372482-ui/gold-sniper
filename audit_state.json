@@ -1,6 +1,5 @@
 {
  "state.json|GOLD|1795053600": "OK",
  "state_index_v2.json|NIFTY 50|1795067100": "OK",
- "state_index_v2.json|SENSEX|1795061700": "OK",
- "state_index_v2.json|NASDAQ 100|1794967200": "LEGACY"
+ "state_index_v2.json|SENSEX|1795061700": "OK"
 }
