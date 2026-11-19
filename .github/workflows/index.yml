@@ -6,6 +6,12 @@
 #      trade par purane din ka close use ho raha tha, aaj ka open nahi.
 # v11: PSL 0.30 -> 0.20 (premium SL chhota). Sirf NIFTY + SENSEX par asar;
 #      NASDAQ ke paas options nahi, gold alag file hai.
+# v12.3 (19-Nov): PREMIUM ASLI NSE SE -- trade khula hone ke BAAD bhi. v12 sirf
+#      ENTRY par asli LTP leta tha; uske baad PSL/PTP model se chalta tha. Model
+#      (IV 11%) OTM3 ka premium 33% sasta deta hai (model 50.38 vs asli 74.90),
+#      isliye premium-stop galat jagah lagta tha. Ab: live trade ka har scan NSE
+#      chain se asli premium leta hai; NSE na de to purana model -- bot nahi rukta.
+#      OFFLINE replay me kabhi nahi (warna history me aaj ka price ghus jayega).
 # v12.1 (16-Nov): State save me retry ke beech SLEEP (4/8/12/16s, 5 koshish).
 #      Pehle 3 retry bina sleep 1 second me fail ho jate the (08:34, 08:42).
 #      Trading logic me koi change NAHI -- sirf state push zyada mehnat karta hai.
@@ -280,6 +286,26 @@ jobs:
                   print('nse_ltp unavailable:', type(e).__name__, str(e)[:120])
               _LTP_CACHE[key] = val
               return val
+
+
+          def real_premium(t, bar, now):
+              """v12.3: open trade ka ASLI option premium NSE se.
+              Sirf LIVE aur taaza bar par (1 ghante ke andar). OFFLINE replay me kabhi nahi.
+              Na mile to None -> caller model use karega."""
+              if OFFLINE or not (t.get('K') and t.get('p0')):
+                  return None
+              if not (t.get('exp') and t.get('mkt')):
+                  return None
+              sym = NSE_SYM.get(t['mkt'])
+              if not sym:
+                  return None
+              if now - bar['t'] > 3600 or now < bar['t']:
+                  return None
+              try:
+                  return nse_ltp(sym, t['exp'], t['K'], t['side'] == 1)
+              except Exception as e:
+                  print('real_premium fail:', type(e).__name__, str(e)[:100])
+                  return None
 
 
           def opt_now(t, spot, dte):
@@ -612,7 +638,12 @@ jobs:
                       # (a) premium based stop -- fires on option value, not index points
                       if t.get('K') and t.get('p0') and t.get('psl'):
                           dl_ = max(t.get('dte', 3) - (bar['t'] - t['bar']) / 86400.0, 0.25)
-                          pn_ = opt_now(t, bar['c'], dl_)
+                          pn_ = real_premium(t, bar, now)
+                          if pn_ is None:
+                              pn_ = opt_now(t, bar['c'], dl_)
+                          else:
+                              print(name, 'ASLI premium', round(pn_, 2),
+                                    '| model', round(opt_now(t, bar['c'], dl_), 2))
                           chg_ = (pn_ - t['p0']) / t['p0'] * 100.0
                           if pn_ <= t['psl']:
                               hit = ('SL', bar['c'])
@@ -643,7 +674,9 @@ jobs:
                           oline = ''
                           if t.get('K') and t.get('p0'):
                               dleft = t.get('dte', 3) - (bar['t'] - t['bar']) / 86400.0
-                              px = opt_now(t, hit[1], dleft)
+                              px = real_premium(t, bar, now)
+                              if px is None:
+                                  px = opt_now(t, hit[1], dleft)
                               oline = '\n🎫 {} {} ~₹{:,.0f} → <b>{:+.0f}%</b>'.format(
                                   t['K'], 'CE' if t['side'] == 1 else 'PE', px,
                                   (px - t['p0']) / t['p0'] * 100)
@@ -739,7 +772,7 @@ jobs:
                   else:
                       m.append('🎯 Target risk ₹{:,.0f} → 1 lot se {:,.0f} (apne account se compare karein)'
                                .format(tgt, risk * M['units'][0][1]))
-                  K, p0, pm0, psrc = 0, 0.0, 0.0, 'model'
+                  K, p0, pm0, psrc, exp_s = 0, 0.0, 0.0, 'model', ''
                   if M.get('opt'):
                       oq, ost, ootm = M['opt']
                       K = int(round(bar['c'] / ost) * ost + ootm * ost * side)   # + = OTM
@@ -749,6 +782,7 @@ jobs:
                       pm0 = opt_leg(bar['c'], K, dte, call)
                       p0 = pm0
                       # v12: NSE ka ASLI LTP. Mil jaye to sab kuch usi par.
+                      exp_s = exp_d.strftime('%d-%b-%Y') if exp_d else ''
                       if NSE_SYM.get(name) and exp_d:
                           _rl = nse_ltp(NSE_SYM[name], exp_d.strftime('%d-%b-%Y'), K, call)
                           if _rl and _rl > 0:
@@ -803,7 +837,8 @@ jobs:
                                  'pm0': pm0, 'src': psrc,
                                  'psl': (p0 * (1.0 - PSL) if M.get('opt') else 0.0),
                                  'ptp': (p0 * (1.0 + PTP) if M.get('opt') else 0.0),
-                                 'dte': (dte if M.get('opt') else 3)}
+                                 'dte': (dte if M.get('opt') else 3),
+                                 'exp': exp_s, 'mkt': name}
                   changed = True
                   fired += 1
                   print(name, 'SIGNAL SENT')
