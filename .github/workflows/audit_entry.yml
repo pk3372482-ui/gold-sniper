@@ -125,14 +125,21 @@ jobs:
               fin = [t for t in C if now >= t + step + LAG]
               if fin:
                   newest = max(fin)
-                  if (newest - (blk.get('last') or 0) > 3 * step
-                          and newest > now - 3 * 3600):
-                      miss = int((newest - (blk.get('last') or 0)) / step)
-                      problems.append('SCAN MISS: {} ka state {} bar peeche hai '
-                                      '(cron band ya fail). Last bar {}'.format(
-                                          J['name'], miss,
-                                          datetime.fromtimestamp(newest + IST_OFF,
-                                                                 timezone.utc).strftime('%d-%b %H:%M')))
+                  _last = blk.get('last') or 0
+                  if newest - _last > 3 * step and newest > now - 3 * 3600:
+                      # v2 (23-Nov-2026): WEEKEND FALSE ALARM FIX.
+                      # Pehle calendar bars ginte the -> gold/NASDAQ ka weekend gap
+                      # (~48 ghante) "cron band" jaisa dikhta tha. 23-Nov ko isi
+                      # wajah se do laal alert aaye, jabki bot theek tha.
+                      # Ab sirf ASLI bars ginte hain jo data me maujood hain.
+                      # Market band tha = data me bar hi nahi = miss chhota.
+                      miss = len([t for t in C if _last < t <= newest])
+                      if miss > 3:
+                          problems.append('SCAN MISS: {} ka state {} bar peeche hai '
+                                          '(cron band ya fail). Last bar {}'.format(
+                                              J['name'], miss,
+                                              datetime.fromtimestamp(newest + IST_OFF,
+                                                                     timezone.utc).strftime('%d-%b %H:%M')))
 
               tr = blk.get('trade')
               if not tr:
